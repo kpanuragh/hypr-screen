@@ -2,6 +2,11 @@
 
 Use your Android phone as an extra **Hyprland** monitor, with **touch** and **keyboard**, a bit like Apple Sidecar.
 
+<p align="center">
+  <a href="docs/demo.mp4"><img src="docs/demo.gif" alt="Hypr Screen demo: a phone used as a Hyprland monitor, typing with the phone keyboard and browsing" width="720"></a>
+  <br><sub>Phone as a Hyprland monitor: touch, keyboard with Super/Ctrl/Alt row, browsing. <a href="docs/demo.mp4">Full video (MP4)</a></sub>
+</p>
+
 Plug the phone in over USB and it becomes a real Hyprland output next to your laptop screen. Drag windows onto it, move workspaces to it, tap and scroll with your fingers, and type with the phone keyboard. Unplug it and the monitor disappears. It also works over Wi-Fi after one USB connection.
 
 ## Features
