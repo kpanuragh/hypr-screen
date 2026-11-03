@@ -48,6 +48,8 @@ mise use -g github:kpanuragh/hypr-screen
 hypr-screen --install-service
 ```
 
+mise waits 24 hours before offering a new release (its `minimum_release_age` setting). To install a release on its first day, pin it, for example `github:kpanuragh/hypr-screen@0.2.0`.
+
 Or from a git checkout:
 
 ```sh
