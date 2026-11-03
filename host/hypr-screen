@@ -1,0 +1,724 @@
+#!/usr/bin/env python3
+"""hypr-screen: use an Android phone as an extra Hyprland monitor, Sidecar-style.
+
+Runs as a background user service (see install.sh):
+  * USB: when a phone with the Hypr Screen app is plugged in, writes the pairing
+    record into the app's private storage with adb, sets up `adb reverse` and
+    opens the app, which connects and becomes a monitor.
+  * Wi-Fi (opt-in): answers discovery broadcasts so paired phones can connect.
+
+Security: every connection is TLS 1.3 with a self-signed certificate that the
+phone pins (fingerprint delivered over adb), and the phone must prove it holds
+the pairing secret (HMAC over both sides' nonces). The secret never travels
+over the socket.
+
+Each session creates a headless Hyprland output at the phone's resolution,
+captures it with wf-recorder (H.264, VAAPI) and streams it to the phone; touch
+and key events come back and are replayed through uinput devices.
+Settings: ~/.config/hypr-screen/config.json
+"""
+import argparse
+import hashlib
+import hmac
+import json
+import os
+import queue
+import shutil
+import signal
+import socket
+import ssl
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+PORT = 7878
+OUTPUT = "HYPRSCREEN"
+PACKAGE = "com.hyprscreen"
+PAIR_DIR = f"/sdcard/Android/data/{PACKAGE}/files"
+PROTO = "3"
+FLAG_CONFIG, FLAG_KEY = 1, 2
+START = b"\x00\x00\x00\x01"
+CONF_DIR = os.path.expanduser("~/.config/hypr-screen")
+HANDSHAKE_SECONDS = 6
+MAX_PENDING = 8  # unauthenticated connections handled at once
+DEFAULTS = {
+    "scale": 1.5,
+    "position": "auto-right",
+    "fps": 60,
+    "qp": 24,
+    "encoder": "vaapi",
+    "device": "/dev/dri/renderD128",
+    "auto_usb": True,
+    "wifi": False,
+}
+
+
+def log(msg):
+    print(f"hypr-screen: {msg}", file=sys.stderr, flush=True)
+
+
+def run(*cmd, check=True, timeout=15):
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if check and r.returncode != 0:
+        raise RuntimeError(f"{' '.join(cmd)} failed: {(r.stderr or r.stdout).strip()}")
+    return r.stdout.strip()
+
+
+def notify(title, body=""):
+    try:
+        subprocess.run(["notify-send", "-a", "Hypr Screen", "-i", "video-display", title, body],
+                       capture_output=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def quietly(fn, *args):
+    try:
+        fn(*args)
+    except Exception as e:  # cleanup steps must never stop the next one
+        log(f"cleanup: {getattr(fn, '__name__', fn)}: {e}")
+
+
+# --------------------------------------------------------------------- config / identity
+
+def load_config():
+    os.makedirs(CONF_DIR, mode=0o700, exist_ok=True)
+    path = os.path.join(CONF_DIR, "config.json")
+    cfg = dict(DEFAULTS)
+    if os.path.exists(path):
+        with open(path) as f:
+            cfg.update(json.load(f))
+    else:
+        with open(path, "w") as f:
+            json.dump(DEFAULTS, f, indent=2)
+    return cfg
+
+
+def _write_private(path, data):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(data)
+
+
+def load_identity():
+    """Host id, pairing secret and TLS certificate (all created on first run)."""
+    path = os.path.join(CONF_DIR, "identity.json")
+    if os.path.exists(path):
+        with open(path) as f:
+            ident = json.load(f)
+    else:
+        ident = {"id": os.urandom(6).hex(), "secret": os.urandom(32).hex()}
+        _write_private(path, json.dumps(ident))
+
+    cert = os.path.join(CONF_DIR, "cert.pem")
+    key = os.path.join(CONF_DIR, "key.pem")
+    if not (os.path.exists(cert) and os.path.exists(key)):
+        old = os.umask(0o077)
+        try:
+            run("openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
+                "-nodes", "-keyout", key, "-out", cert, "-days", "3650", "-subj", "/CN=hypr-screen")
+        finally:
+            os.umask(old)
+    with open(cert) as f:
+        der = ssl.PEM_cert_to_DER_cert(f.read())
+    ident["cert"], ident["key"] = cert, key
+    ident["fingerprint"] = hashlib.sha256(der).hexdigest()
+    return ident
+
+
+def tls_context(ident):
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+    ctx.load_cert_chain(ident["cert"], ident["key"])
+    return ctx
+
+
+def mac(secret_hex, label, server_nonce, client_nonce):
+    msg = f"{label}|{server_nonce}|{client_nonce}".encode()
+    return hmac.new(bytes.fromhex(secret_hex), msg, hashlib.sha256).hexdigest()
+
+
+# --------------------------------------------------------------------- hyprland
+
+def set_monitor(mode, position, scale):
+    """Apply a monitor rule; Hyprland's Lua config needs `eval`, older ones `keyword`."""
+    lua = f'hl.monitor({{ output = "{OUTPUT}", mode = "{mode}", position = "{position}", scale = {scale} }})'
+    out = run("hyprctl", "eval", lua, check=False)
+    if out.strip() != "ok":
+        run("hyprctl", "keyword", "monitor", f"{OUTPUT},{mode},{position},{scale}")
+
+
+def add_monitor(w, h, cfg):
+    run("hyprctl", "output", "remove", OUTPUT, check=False)  # stale from a crash
+    out = run("hyprctl", "output", "create", "headless", OUTPUT)
+    if out.strip() != "ok":
+        raise RuntimeError(f"could not create output: {out}")
+    set_monitor(f"{int(w)}x{int(h)}@{int(cfg['fps'])}", cfg["position"], float(cfg["scale"]))
+
+
+def remove_monitor():
+    run("hyprctl", "output", "remove", OUTPUT, check=False)
+
+
+def recorder_cmd(cfg, fifo):
+    g = str(int(cfg["fps"]) * 2)
+    cmd = ["wf-recorder", "-y", "-o", OUTPUT, "-m", "flv", "-f", fifo]
+    if cfg["encoder"] == "vaapi":
+        cmd += ["-c", "h264_vaapi", "-d", cfg["device"],
+                "-p", "bf=0", "-p", f"g={g}", "-p", f"qp={int(cfg['qp'])}"]
+    else:
+        cmd += ["-c", "libx264", "-x", "yuv420p", "-p", "preset=ultrafast",
+                "-p", "tune=zerolatency", "-p", f"crf={int(cfg['qp'])}", "-p", "bf=0", "-p", f"g={g}"]
+    return cmd
+
+
+# --------------------------------------------------------------------- FLV -> frames
+
+def read_exact(f, n):
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = f.read(n - len(buf))
+        if not chunk:
+            raise EOFError
+        buf += chunk
+    return bytes(buf)
+
+
+def avcc_to_annexb(payload, nal_len_size):
+    out, i = bytearray(), 0
+    while i + nal_len_size <= len(payload):
+        n = int.from_bytes(payload[i:i + nal_len_size], "big")
+        i += nal_len_size
+        out += START + payload[i:i + n]
+        i += n
+    return bytes(out)
+
+
+def parse_avcc_config(body):
+    """AVCDecoderConfigurationRecord -> (Annex-B SPS+PPS, NAL length size)."""
+    nal_len_size = (body[4] & 3) + 1
+    out, p = bytearray(), 6
+    for _ in range(body[5] & 0x1F):
+        n = int.from_bytes(body[p:p + 2], "big"); p += 2
+        out += START + body[p:p + n]; p += n
+    npps = body[p]; p += 1
+    for _ in range(npps):
+        n = int.from_bytes(body[p:p + 2], "big"); p += 2
+        out += START + body[p:p + n]; p += n
+    return bytes(out), nal_len_size
+
+
+def flv_frames(fifo_path, out_q, stop):
+    """Thread: wf-recorder FLV -> framed H.264 access units on out_q (None = end)."""
+    try:
+        with open(fifo_path, "rb", buffering=0) as f:
+            read_exact(f, 9 + 4)  # FLV header + PreviousTagSize0
+            nal_len_size = 4
+            while not stop.is_set():
+                th = read_exact(f, 11)
+                size = int.from_bytes(th[1:4], "big")
+                ts = int.from_bytes(th[4:7], "big") | (th[7] << 24)
+                data = read_exact(f, size)
+                read_exact(f, 4)
+                if th[0] != 9 or len(data) < 5 or (data[0] & 0x0F) != 7:
+                    continue  # not an AVC video tag
+                body = data[5:]
+                if data[1] == 0:
+                    payload, nal_len_size = parse_avcc_config(body)
+                    flags = FLAG_CONFIG
+                elif data[1] == 1:
+                    payload = avcc_to_annexb(body, nal_len_size)
+                    flags = FLAG_KEY if (data[0] >> 4) == 1 else 0
+                else:
+                    continue
+                frame = struct.pack(">IBI", len(payload), flags, ts & 0xFFFFFFFF) + payload
+                while not stop.is_set():  # backpressure: a slow link slows capture, never drops
+                    try:
+                        out_q.put(frame, timeout=0.2)
+                        break
+                    except queue.Full:
+                        pass
+    except (EOFError, OSError, IndexError):
+        pass
+    finally:
+        try:
+            out_q.put_nowait(None)
+        except queue.Full:
+            pass
+
+
+# --------------------------------------------------------------------- uinput devices
+
+EV_SYN, EV_KEY, EV_ABS = 0, 1, 3
+BTN_TOUCH = 0x14A
+ABS_X, ABS_Y = 0x00, 0x01
+ABS_MT_SLOT, ABS_MT_POSITION_X, ABS_MT_POSITION_Y, ABS_MT_TRACKING_ID = 0x2F, 0x35, 0x36, 0x39
+INPUT_PROP_DIRECT = 0x01
+UI_SET_EVBIT, UI_SET_KEYBIT, UI_SET_ABSBIT, UI_SET_PROPBIT = 0x40045564, 0x40045565, 0x40045567, 0x4004556E
+UI_DEV_SETUP, UI_ABS_SETUP, UI_DEV_CREATE, UI_DEV_DESTROY = 0x405C5503, 0x401C5504, 0x5501, 0x5502
+TOUCH_NAME = "hypr-screen-touch"
+KBD_NAME = "hypr-screen-keyboard"
+MAX_SLOTS = 10
+T_SYNC, T_DOWN, T_MOVE, T_UP = 0, 1, 2, 3
+K_TAP, K_CHAR, K_RAW = 10, 11, 14
+MSG = struct.Struct(">BBHH")  # type, slot/mods, x, y
+
+# Keys a remote device must never press: they act even behind the lock screen.
+KEY_SYSRQ, KEY_POWER, KEY_SLEEP, KEY_WAKEUP, KEY_SUSPEND = 99, 116, 142, 143, 205
+DENIED_KEYS = {KEY_SYSRQ, KEY_POWER, KEY_SLEEP, KEY_WAKEUP, KEY_SUSPEND}
+ALLOWED_KEYS = [k for k in range(1, 248) if k not in DENIED_KEYS]
+
+
+class UInput:
+    """Minimal /dev/uinput device; subclasses describe their capabilities."""
+
+    def __init__(self, name, product, setup):
+        import fcntl
+        self._ioctl = fcntl.ioctl
+        self.fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        try:
+            setup(lambda req, arg: fcntl.ioctl(self.fd, req, arg))
+            fcntl.ioctl(self.fd, UI_DEV_SETUP, struct.pack("<HHHH80sI", 0x06, 0x1209, product, 1, name.encode(), 0))
+            fcntl.ioctl(self.fd, UI_DEV_CREATE, 0)
+        except Exception:
+            os.close(self.fd)
+            raise
+
+    def emit(self, t, code, value):
+        os.write(self.fd, struct.pack("llHHi", 0, 0, t, code, value))
+
+    def destroy(self):
+        try:
+            self._ioctl(self.fd, UI_DEV_DESTROY, 0)
+        finally:
+            os.close(self.fd)
+
+
+class Touchscreen(UInput):
+    """A virtual multitouch screen; Hyprland maps it onto the phone's output."""
+
+    def __init__(self, w, h, dpi):
+        dpi = min(max(int(dpi), 50), 1000)
+        res_x = max(1, round(65535 / (w / dpi * 25.4)))  # units per mm, for gesture speed
+        res_y = max(1, round(65535 / (h / dpi * 25.4)))
+
+        def setup(io):
+            for ev in (EV_SYN, EV_KEY, EV_ABS):
+                io(UI_SET_EVBIT, ev)
+            io(UI_SET_KEYBIT, BTN_TOUCH)
+            io(UI_SET_PROPBIT, INPUT_PROP_DIRECT)
+            for code, mx, res in ((ABS_X, 65535, res_x), (ABS_Y, 65535, res_y),
+                                  (ABS_MT_SLOT, MAX_SLOTS - 1, 0),
+                                  (ABS_MT_POSITION_X, 65535, res_x), (ABS_MT_POSITION_Y, 65535, res_y),
+                                  (ABS_MT_TRACKING_ID, 65535, 0)):
+                io(UI_SET_ABSBIT, code)
+                io(UI_ABS_SETUP, struct.pack("<H2xiiiiii", code, 0, 0, mx, 0, 0, res))
+
+        super().__init__(TOUCH_NAME, 0x7878, setup)
+        self.active = {}  # slot -> tracking id
+        self.next_id = 1
+        self.primary = None
+
+    def handle(self, kind, slot, x, y):
+        if kind == T_SYNC:
+            self.emit(EV_SYN, 0, 0)
+            return
+        if slot >= MAX_SLOTS:
+            return
+        if kind == T_DOWN:
+            if slot in self.active:
+                return
+            self.emit(EV_ABS, ABS_MT_SLOT, slot)
+            self.emit(EV_ABS, ABS_MT_TRACKING_ID, self.next_id)
+            self.active[slot] = self.next_id
+            self.next_id = (self.next_id % 65535) + 1
+            self.emit(EV_ABS, ABS_MT_POSITION_X, x)
+            self.emit(EV_ABS, ABS_MT_POSITION_Y, y)
+            if self.primary is None:
+                self.primary = slot
+                self.emit(EV_KEY, BTN_TOUCH, 1)
+        elif kind == T_MOVE and slot in self.active:
+            self.emit(EV_ABS, ABS_MT_SLOT, slot)
+            self.emit(EV_ABS, ABS_MT_POSITION_X, x)
+            self.emit(EV_ABS, ABS_MT_POSITION_Y, y)
+        elif kind == T_UP and slot in self.active:
+            self.emit(EV_ABS, ABS_MT_SLOT, slot)
+            self.emit(EV_ABS, ABS_MT_TRACKING_ID, -1)
+            del self.active[slot]
+            if not self.active:
+                self.primary = None
+                self.emit(EV_KEY, BTN_TOUCH, 0)
+        if slot == self.primary and kind in (T_DOWN, T_MOVE):
+            self.emit(EV_ABS, ABS_X, x)
+            self.emit(EV_ABS, ABS_Y, y)
+
+    def close(self):
+        try:
+            for slot in list(self.active):
+                self.handle(T_UP, slot, 0, 0)
+            self.handle(T_SYNC, 0, 0, 0)
+        finally:
+            self.destroy()
+
+
+MOD_CTRL, MOD_ALT, MOD_SHIFT, MOD_SUPER = 1, 2, 4, 8
+MOD_KEYS = ((MOD_CTRL, 29), (MOD_ALT, 56), (MOD_SHIFT, 42), (MOD_SUPER, 125))
+
+
+def _us_keymap():
+    """char -> (evdev keycode, needs shift) for the US layout."""
+    m = {}
+    for row, start in (("qwertyuiop", 16), ("asdfghjkl", 30), ("zxcvbnm", 44)):
+        for i, c in enumerate(row):
+            m[c] = (start + i, False)
+            m[c.upper()] = (start + i, True)
+    for i, c in enumerate("1234567890"):
+        m[c] = (2 + i, False)
+    for i, c in enumerate("!@#$%^&*()"):
+        m[c] = (2 + i, True)
+    plain = {"-": 12, "=": 13, "[": 26, "]": 27, ";": 39, "'": 40, "`": 41, "\\": 43,
+             ",": 51, ".": 52, "/": 53, " ": 57, "\n": 28, "\t": 15}
+    shifted = {"_": 12, "+": 13, "{": 26, "}": 27, ":": 39, '"': 40, "~": 41, "|": 43,
+               "<": 51, ">": 52, "?": 53}
+    m.update({c: (k, False) for c, k in plain.items()})
+    m.update({c: (k, True) for c, k in shifted.items()})
+    return m
+
+
+US_KEYMAP = _us_keymap()
+
+
+class Keyboard(UInput):
+    """A virtual keyboard: phone keyboard text, extra keys and Bluetooth keyboards."""
+
+    def __init__(self):
+        def setup(io):
+            io(UI_SET_EVBIT, EV_SYN)
+            io(UI_SET_EVBIT, EV_KEY)
+            for code in ALLOWED_KEYS:
+                io(UI_SET_KEYBIT, code)
+
+        super().__init__(KBD_NAME, 0x7879, setup)
+        self.down = set()
+
+    def _key(self, code, value):
+        if code in DENIED_KEYS or not 0 < code < 248:
+            return
+        self.emit(EV_KEY, code, value)
+        self.emit(EV_SYN, 0, 0)
+        (self.down.add if value else self.down.discard)(code)
+
+    def tap(self, code, mods=0):
+        held = [k for bit, k in MOD_KEYS if mods & bit]
+        for k in held:
+            self._key(k, 1)
+        self._key(code, 1)
+        self._key(code, 0)
+        for k in reversed(held):
+            self._key(k, 0)
+
+    def char(self, cp, mods=0):
+        ch = chr(cp)
+        if ch in US_KEYMAP:
+            code, shift = US_KEYMAP[ch]
+            self.tap(code, mods | (MOD_SHIFT if shift else 0))
+        elif ch.isprintable() and shutil.which("wtype"):
+            try:
+                subprocess.run(["wtype", "--", ch], capture_output=True, timeout=2)  # any Unicode
+            except subprocess.TimeoutExpired:
+                pass
+
+    def handle(self, kind, mods, x, y):
+        if kind == K_TAP:
+            self.tap(x, mods)
+        elif kind == K_CHAR:
+            cp = x | (y << 16)
+            if 0x20 <= cp < 0x110000 or cp in (0x09, 0x0A):
+                self.char(cp, mods)
+        elif kind == K_RAW:
+            self._key(x, 1 if y else 0)
+
+    def close(self):
+        try:
+            for code in list(self.down):
+                self._key(code, 0)
+        finally:
+            self.destroy()
+
+
+def map_touch_to_output():
+    lua = f'hl.device({{ name = "{TOUCH_NAME}", output = "{OUTPUT}" }})'
+    if run("hyprctl", "eval", lua, check=False).strip() != "ok":
+        run("hyprctl", "keyword", f"device[{TOUCH_NAME}]:output", OUTPUT, check=False)
+
+
+# --------------------------------------------------------------------- daemon
+
+class Daemon:
+    def __init__(self, cfg, ident):
+        self.cfg = cfg
+        self.ident = ident
+        self.ctx = tls_context(ident)
+        self.busy = threading.Lock()
+        self.pending = threading.BoundedSemaphore(MAX_PENDING)
+        self.hostname = socket.gethostname().replace(" ", "-")[:64] or "laptop"
+
+    # ---- TCP: TLS + challenge, then one display session at a time
+    def serve(self):
+        bind = "0.0.0.0" if self.cfg["wifi"] else "127.0.0.1"
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind((bind, PORT))
+        srv.listen(16)
+        log(f"listening on {bind}:{PORT} (host {self.hostname}, id {self.ident['id']})")
+        while True:
+            try:
+                conn, addr = srv.accept()
+            except OSError as e:  # e.g. EMFILE under load: back off, keep serving
+                log(f"accept: {e}")
+                time.sleep(0.5)
+                continue
+            if not self.pending.acquire(blocking=False):
+                conn.close()  # too many unauthenticated connections
+                continue
+            try:
+                threading.Thread(target=self.session, args=(conn, addr), daemon=True).start()
+            except RuntimeError:
+                self.pending.release()
+                conn.close()
+
+    def session(self, conn, addr):
+        authed = False
+        tls = None
+        try:
+            tls, w, h, dpi = self.handshake(conn)
+            if tls is None:
+                return
+            self.pending.release()
+            authed = True
+            if not self.busy.acquire(blocking=False):
+                tls.sendall(b"BUSY\n")
+                return
+            try:
+                tls.sendall(b"OK\n")
+                self.stream(tls, w, h, dpi, "USB" if addr[0] == "127.0.0.1" else addr[0])
+            finally:
+                self.busy.release()
+        except Exception as e:  # keep the daemon alive whatever a client does
+            log(f"session from {addr[0]} ended: {e}")
+        finally:
+            if not authed:
+                self.pending.release()
+            for s in (tls, conn):
+                if s is not None:
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
+
+    def handshake(self, conn):
+        """TLS, then: HELLO -> HYPRSCREEN <w> <h> <dpi> <client nonce> <proof>. Returns (tls, w, h, dpi)."""
+        deadline = time.monotonic() + HANDSHAKE_SECONDS
+        conn.settimeout(HANDSHAKE_SECONDS)
+        tls = self.ctx.wrap_socket(conn, server_side=True)
+        nonce = os.urandom(16).hex()
+        tls.sendall(f"HELLO {PROTO} {self.ident['id']} {self.hostname} {nonce}\n".encode())
+        line = b""
+        while not line.endswith(b"\n"):
+            left = deadline - time.monotonic()
+            if left <= 0 or len(line) > 512:
+                return None, 0, 0, 0
+            tls.settimeout(left)
+            chunk = tls.recv(256)
+            if not chunk:
+                return None, 0, 0, 0
+            line += chunk
+        parts = line.decode(errors="replace").split()
+        if parts[:1] == ["PING"]:
+            return None, 0, 0, 0  # availability probe from the app
+        if len(parts) != 7 or parts[:2] != ["HYPRSCREEN", PROTO]:
+            return None, 0, 0, 0
+        try:
+            w, h, dpi = int(parts[2]), int(parts[3]), int(parts[4])
+        except ValueError:
+            return None, 0, 0, 0
+        client_nonce, proof = parts[5], parts[6]
+        if len(client_nonce) != 32 or not hmac.compare_digest(
+                proof, mac(self.ident["secret"], "c", nonce, client_nonce)):
+            tls.sendall(b"DENIED\n")
+            log("rejected a device without a valid pairing")
+            return None, 0, 0, 0
+        if not (100 <= w <= 8192 and 100 <= h <= 8192):
+            return None, 0, 0, 0
+        return tls, w, h, dpi
+
+    def stream(self, sock, w, h, dpi, via):
+        # The TLS socket is used from this thread only (OpenSSL objects aren't thread-safe).
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for opt, val in (("TCP_KEEPIDLE", 3), ("TCP_KEEPINTVL", 2), ("TCP_KEEPCNT", 3), ("TCP_USER_TIMEOUT", 6000)):
+            if hasattr(socket, opt):
+                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), val)
+
+        tmp = tempfile.mkdtemp(prefix="hypr-screen-")
+        fifo = os.path.join(tmp, "stream.flv")
+        errlog_path = os.path.join(tmp, "wf-recorder.log")
+        os.mkfifo(fifo, 0o600)
+        rec = touch = keyboard = None
+        stop = threading.Event()
+        frames = queue.Queue(maxsize=8)
+        try:
+            add_monitor(w, h, self.cfg)
+            log(f"display session via {via}: {w}x{h} scale {self.cfg['scale']}")
+            notify("Phone connected as a display", f"{w}×{h} via {via}")
+            try:
+                map_touch_to_output()
+                touch = Touchscreen(w, h, dpi)
+                keyboard = Keyboard()
+            except OSError as e:
+                log(f"touch/keyboard input unavailable: {e}")
+            with open(errlog_path, "w") as errlog:
+                rec = subprocess.Popen(recorder_cmd(self.cfg, fifo), stdin=subprocess.DEVNULL,
+                                       stdout=subprocess.DEVNULL, stderr=errlog)
+            threading.Thread(target=flv_frames, args=(fifo, frames, stop), daemon=True).start()
+            self.loop(sock, frames, touch, keyboard, rec)
+            if rec.poll() is not None:
+                with open(errlog_path) as f:
+                    tail = f.read().strip().splitlines()[-4:]
+                log("wf-recorder exited: " + " | ".join(tail))
+        finally:
+            stop.set()
+            if rec and rec.poll() is None:
+                rec.terminate()
+                try:
+                    rec.wait(2)
+                except subprocess.TimeoutExpired:
+                    rec.kill()
+            try:  # unblock the reader if it is still waiting to open the fifo
+                os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+            except OSError:
+                pass
+            if touch:
+                quietly(touch.close)
+            if keyboard:
+                quietly(keyboard.close)
+            quietly(remove_monitor)
+            shutil.rmtree(tmp, ignore_errors=True)
+            log("display session ended")
+            notify("Phone display disconnected")
+
+    def loop(self, sock, frames, touch, keyboard, rec):
+        """Single-threaded pump: send frames, apply input, until either side stops."""
+        buf = b""
+        while True:
+            try:
+                frame = frames.get(timeout=0.004)
+            except queue.Empty:
+                frame = b""
+            if frame is None or rec.poll() is not None:
+                return
+            if frame:
+                sock.settimeout(10)
+                sock.sendall(frame)
+            sock.settimeout(0)
+            while True:  # drain everything the phone has sent
+                try:
+                    chunk = sock.recv(16384)
+                except (ssl.SSLWantReadError, BlockingIOError, socket.timeout):
+                    break
+                if not chunk:
+                    return  # phone disconnected
+                buf += chunk
+                if len(buf) > 1 << 20:
+                    raise RuntimeError("input flood")
+            n = len(buf) // MSG.size * MSG.size
+            for off in range(0, n, MSG.size):
+                msg = MSG.unpack_from(buf, off)
+                if msg[0] >= K_TAP:
+                    if keyboard:
+                        keyboard.handle(*msg)
+                elif touch:
+                    touch.handle(*msg)
+            buf = buf[n:]
+
+    # ---- UDP discovery for Wi-Fi
+    def discovery(self):
+        u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        u.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        u.bind(("0.0.0.0", PORT))
+        reply = f"HYPRSCREEN-HERE {PROTO} {self.ident['id']} {self.hostname}".encode()
+        while True:
+            try:
+                data, addr = u.recvfrom(256)
+                if data.startswith(b"HYPRSCREEN-DISCOVER"):
+                    u.sendto(reply, addr)
+            except OSError as e:
+                log(f"discovery: {e}")
+                time.sleep(1)
+
+    # ---- USB: pair over adb, then launch the app
+    def pair_over_adb(self, serial):
+        """Write the pairing record into the app's private storage (other apps can't read it)."""
+        record = json.dumps({"id": self.ident["id"], "name": self.hostname,
+                             "secret": self.ident["secret"], "fingerprint": self.ident["fingerprint"]})
+        fd, path = tempfile.mkstemp(prefix="hypr-screen-pair-", dir=os.environ.get("XDG_RUNTIME_DIR"))
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(record)
+            run("adb", "-s", serial, "shell", "mkdir", "-p", PAIR_DIR, check=False)
+            run("adb", "-s", serial, "push", path, f"{PAIR_DIR}/pair-{self.ident['id']}.json")
+        finally:
+            os.unlink(path)
+
+    def usb_watch(self):
+        known = set()
+        while True:
+            try:
+                out = run("adb", "devices", check=False, timeout=10)
+                serials = {l.split()[0] for l in out.splitlines()[1:] if l.strip().endswith("\tdevice")}
+                for s in serials - known:
+                    if not run("adb", "-s", s, "shell", "pm", "path", PACKAGE, check=False, timeout=10):
+                        continue  # app not installed on this device
+                    try:
+                        self.pair_over_adb(s)
+                    except (RuntimeError, OSError, subprocess.TimeoutExpired) as e:
+                        log(f"pairing {s} failed: {e}")
+                        continue
+                    run("adb", "-s", s, "reverse", f"tcp:{PORT}", f"tcp:{PORT}", check=False)
+                    log(f"USB phone {s} paired and ready")
+                    if self.cfg["auto_usb"] and not self.busy.locked():
+                        run("adb", "-s", s, "shell", "am", "start", "-n", f"{PACKAGE}/.MainActivity",
+                            "--ez", "autoconnect_usb", "true", check=False)
+                known = serials
+            except (subprocess.TimeoutExpired, OSError) as e:
+                log(f"adb: {e}")
+            time.sleep(2)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Use an Android phone as a Hyprland monitor (background service).")
+    ap.add_argument("--no-usb", action="store_true", help="don't watch for USB phones")
+    args = ap.parse_args()
+    for tool in ("hyprctl", "wf-recorder", "openssl"):
+        if not shutil.which(tool):
+            sys.exit(f"{tool} not found (sudo pacman -S {tool})")
+
+    cfg = load_config()
+    d = Daemon(cfg, load_identity())
+    remove_monitor()  # leftover from a crash
+    signal.signal(signal.SIGTERM, lambda *_: (remove_monitor(), os._exit(0)))
+    if cfg["wifi"]:
+        threading.Thread(target=d.discovery, daemon=True).start()
+    if shutil.which("adb") and not args.no_usb:
+        threading.Thread(target=d.usb_watch, daemon=True).start()
+    try:
+        d.serve()
+    except KeyboardInterrupt:
+        remove_monitor()
+
+
+if __name__ == "__main__":
+    main()

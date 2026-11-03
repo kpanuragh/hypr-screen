@@ -1,0 +1,18 @@
+# Android / Gradle
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Signing material — never commit
+*.jks
+*.keystore
+keystore.properties
+
+# Python
+__pycache__/
+*.pyc
