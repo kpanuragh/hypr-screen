@@ -16,9 +16,14 @@ Plug the phone in over USB and it becomes a real Hyprland output next to your la
 - **Portrait or landscape.** Choose an orientation, or let the monitor auto-rotate with the phone. Hyprland gets a real portrait monitor, not a rotated picture.
 - **Display settings on the phone.** Resolution, frame rate (a 50% / 30 fps battery saver), text size and codec.
 - **Plug-and-play USB.** A background service notices the phone, opens the app and connects. Nothing to run by hand.
-- **Wi-Fi (opt-in).** The app discovers your laptop on the local network. Pair once by tapping **Pair** and accepting on the laptop (like Bluetooth), or just plug in USB once. If Wi-Fi drops, the phone reconnects by itself, and the laptop keeps its monitor (and your windows on it) for 15 seconds.
+- **Wi-Fi (opt-in).** The app discovers your laptop on the local network. Pair once by tapping **Pair** and accepting on the laptop (like Bluetooth), or just plug in USB once. On a slow network, quality and then frame rate step down automatically and come back when it recovers. If Wi-Fi drops, the phone reconnects by itself, and the laptop keeps its monitor (and your windows on it) for 15 seconds.
 - **Secure by default.** Every connection is TLS 1.3 with a pinned certificate, and the phone must prove it holds its pairing key.
 - **Multitouch.** A virtual touchscreen is mapped onto the phone's monitor, so you can tap, drag, scroll and pinch.
+- **Stylus.** A pen (S Pen, USI) becomes a drawing tablet with pressure, tilt, eraser, side button and hover. It works in Krita, Xournal++, GIMP and other tablet-aware apps.
+- **Trackpad mode.** Tap the 🖱 button to use the phone like a laptop touchpad for the whole desktop:
+  - Tap to click; hold, then move to drag.
+  - Two-finger tap for right-click; two-finger drag to scroll.
+  - Three-finger tap for middle-click; three-finger swipe to switch workspace.
 - **Keyboard.** Type with the phone keyboard; the picture shrinks to stay visible above it. An extra key row gives `Esc Tab Ctrl Alt Super ← ↑ ↓ →`, and the modifiers are sticky, so Super then 1 switches workspace. A Bluetooth keyboard paired to the phone is passed straight through.
 
 ## Requirements
@@ -103,6 +108,7 @@ On the phone, the **⌨** button opens the keyboard (drag it to move it). **Back
 | `wifi` | `false` | Also listen on the network (Wi-Fi mode) |
 | `wifi_pairing` | `true` | Allow pairing requests over Wi-Fi (they still need your approval) |
 | `codec` | `"auto"` | `auto` (HEVC when the phone supports it), `h264` or `hevc` |
+| `adaptive` | `true` | On Wi-Fi, lower quality/frame rate while the link can't keep up |
 
 The phone's own Display settings (resolution, frame rate, text size, codec) override `fps` and `scale` for that phone. Restart after editing: `systemctl --user restart hypr-screen`. Logs: `journalctl --user -u hypr-screen -f`.
 

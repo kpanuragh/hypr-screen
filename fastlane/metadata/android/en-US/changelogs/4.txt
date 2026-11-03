@@ -1,0 +1,3 @@
+* Stylus support: pressure, tilt, eraser and side button, with hover. Works in Krita, Xournal++ and other tablet-aware apps
+* Trackpad mode (mouse button): use the phone like a laptop touchpad. Tap to click, hold then move to drag, two-finger tap for right click, two-finger drag to scroll, three-finger swipe to switch workspace
+* Adaptive quality over Wi-Fi: lowers quality or frame rate while the network can't keep up, and goes back up when it recovers

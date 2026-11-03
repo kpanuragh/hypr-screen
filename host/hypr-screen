@@ -42,13 +42,14 @@ import tempfile
 import threading
 import time
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 PORT = 7878
 OUTPUT = "HYPRSCREEN"
 PACKAGE = "com.hyprscreen"
 PAIR_DIR = f"/sdcard/Android/data/{PACKAGE}/files"
 PROTO = "3"
-FLAG_CONFIG, FLAG_KEY, FLAG_INFO = 1, 2, 4  # INFO: "<w> <h> <codec>" before each new stream
+FLAG_CONFIG, FLAG_KEY, FLAG_INFO = 1, 2, 4  # INFO: "<w> <h> <codec> <host features>" before each new stream
+H_PEN, H_TRACKPAD = 1, 2  # host features in INFO (0.4.0+): phones fall back to plain touch without them
 LINGER_SECONDS = 15  # keep a Wi-Fi phone's monitor this long while it reconnects
 START = b"\x00\x00\x00\x01"
 CONF_DIR = os.path.expanduser("~/.config/hypr-screen")
@@ -70,6 +71,7 @@ DEFAULTS = {
     "wifi": False,
     "wifi_pairing": True,
     "codec": "auto",  # auto (HEVC when the phone supports it), h264 or hevc
+    "adaptive": True,  # on Wi-Fi, lower quality / frame rate while the link can't keep up
 }
 
 
@@ -220,15 +222,16 @@ def remove_monitor():
     run("hyprctl", "output", "remove", OUTPUT, check=False)
 
 
-def recorder_cmd(cfg, fifo, codec="h264", fps=None):
+def recorder_cmd(cfg, fifo, codec="h264", fps=None, qp=None):
     g = str(int(fps or cfg["fps"]) * 2)
+    qp = int(qp if qp is not None else cfg["qp"])
     cmd = ["wf-recorder", "-y", "-o", OUTPUT, "-m", "flv", "-f", fifo]
     if cfg["encoder"] == "vaapi":
         cmd += ["-c", "hevc_vaapi" if codec == "hevc" else "h264_vaapi", "-d", cfg["device"],
-                "-p", "bf=0", "-p", f"g={g}", "-p", f"qp={int(cfg['qp'])}"]
+                "-p", "bf=0", "-p", f"g={g}", "-p", f"qp={qp}"]
     else:
         cmd += ["-c", "libx264", "-x", "yuv420p", "-p", "preset=ultrafast",
-                "-p", "tune=zerolatency", "-p", f"crf={int(cfg['qp'])}", "-p", "bf=0", "-p", f"g={g}"]
+                "-p", "tune=zerolatency", "-p", f"crf={qp}", "-p", "bf=0", "-p", f"g={g}"]
     return cmd
 
 
@@ -342,15 +345,22 @@ def flv_frames(fifo_path, out_q, stop):
 
 # --------------------------------------------------------------------- uinput devices
 
-EV_SYN, EV_KEY, EV_ABS = 0, 1, 3
+EV_SYN, EV_KEY, EV_REL, EV_ABS = 0, 1, 2, 3
 BTN_TOUCH = 0x14A
+BTN_LEFT, BTN_RIGHT, BTN_MIDDLE = 0x110, 0x111, 0x112
+BTN_TOOL_PEN, BTN_TOOL_RUBBER, BTN_STYLUS = 0x140, 0x141, 0x14B
 ABS_X, ABS_Y = 0x00, 0x01
+ABS_PRESSURE, ABS_TILT_X, ABS_TILT_Y = 0x18, 0x1A, 0x1B
+REL_X, REL_Y, REL_HWHEEL, REL_WHEEL, REL_WHEEL_HI_RES, REL_HWHEEL_HI_RES = 0x00, 0x01, 0x06, 0x08, 0x0B, 0x0C
 ABS_MT_SLOT, ABS_MT_POSITION_X, ABS_MT_POSITION_Y, ABS_MT_TRACKING_ID = 0x2F, 0x35, 0x36, 0x39
 INPUT_PROP_DIRECT = 0x01
 UI_SET_EVBIT, UI_SET_KEYBIT, UI_SET_ABSBIT, UI_SET_PROPBIT = 0x40045564, 0x40045565, 0x40045567, 0x4004556E
+UI_SET_RELBIT = 0x40045566
 UI_DEV_SETUP, UI_ABS_SETUP, UI_DEV_CREATE, UI_DEV_DESTROY = 0x405C5503, 0x401C5504, 0x5501, 0x5502
 TOUCH_NAME = "hypr-screen-touch"
 KBD_NAME = "hypr-screen-keyboard"
+PEN_NAME = "hypr-screen-pen"
+MOUSE_NAME = "hypr-screen-mouse"
 MAX_SLOTS = 10
 T_SYNC, T_DOWN, T_MOVE, T_UP = 0, 1, 2, 3
 K_TAP, K_CHAR, K_RAW = 10, 11, 14
@@ -358,6 +368,16 @@ K_TAP, K_CHAR, K_RAW = 10, 11, 14
 C_VIEW, C_PREF, C_HELLO, C_BYE = 20, 21, 22, 23  # VIEW: x=w y=h; PREF: slot=key x=value; HELLO: x=features
 F_INFO, F_HEVC = 1, 2  # phone features: understands INFO frames; can decode HEVC
 P_FPS, P_SCALE, P_CODEC, P_RES = 1, 2, 3, 4  # PREF keys: fps; scale*100 (0 = laptop default); 1 = H.264 only; resolution %
+# Stylus (0.4.0): AUX carries x=pressure 0..65535, y=(tilt_x+90) | (tilt_y+90) << 8; POS slot = PEN_* flags.
+S_AUX, S_POS = 30, 31
+PEN_TOUCH, PEN_ERASER, PEN_BUTTON, PEN_RANGE = 1, 2, 4, 8
+# Trackpad mode (0.4.0): x/y are signed 16-bit. BTN slot 0/1/2 = left/right/middle, x = pressed.
+# SCROLL in 1/120 notches. GESTURE slot 1 = next workspace, 2 = previous.
+M_MOVE, M_BTN, M_SCROLL, M_GESTURE = 40, 41, 42, 43
+
+
+def s16(v):
+    return v - 0x10000 if v >= 0x8000 else v
 MSG = struct.Struct(">BBHH")  # type, slot/mods, x, y
 
 # Keys a remote device must never press: they act even behind the lock screen.
@@ -463,6 +483,127 @@ MOD_CTRL, MOD_ALT, MOD_SHIFT, MOD_SUPER = 1, 2, 4, 8
 MOD_KEYS = ((MOD_CTRL, 29), (MOD_ALT, 56), (MOD_SHIFT, 42), (MOD_SUPER, 125))
 
 
+class Pen(UInput):
+    """A virtual drawing tablet (pressure, tilt, eraser, barrel button) mapped onto the phone's output."""
+
+    def __init__(self):
+        def setup(io):
+            for ev in (EV_SYN, EV_KEY, EV_ABS):
+                io(UI_SET_EVBIT, ev)
+            for key in (BTN_TOUCH, BTN_TOOL_PEN, BTN_TOOL_RUBBER, BTN_STYLUS):
+                io(UI_SET_KEYBIT, key)
+            io(UI_SET_PROPBIT, INPUT_PROP_DIRECT)
+            for code, lo, hi in ((ABS_X, 0, 65535), (ABS_Y, 0, 65535), (ABS_PRESSURE, 0, 4095),
+                                 (ABS_TILT_X, -90, 90), (ABS_TILT_Y, -90, 90)):
+                io(UI_SET_ABSBIT, code)
+                io(UI_ABS_SETUP, struct.pack("<H2xiiiiii", code, 0, lo, hi, 0, 0, 0))
+
+        # Map before the device appears, like the touchscreen: Hyprland applies it when a device is added.
+        run_lua_or_legacy(f'hl.device({{ name = "{PEN_NAME}", output = "{OUTPUT}" }})',
+                          "keyword", f"device[{PEN_NAME}]:output", OUTPUT)
+        super().__init__(PEN_NAME, 0x7879, setup)
+        self.tool = None  # BTN_TOOL_PEN / BTN_TOOL_RUBBER while the pen is in range
+        self.touching = self.button = False
+        self.pressure, self.tilt = 0, (0, 0)
+
+    def aux(self, pressure, tilts):
+        self.pressure = pressure * 4095 // 65535
+        self.tilt = (min(max((tilts & 0xFF) - 90, -90), 90), min(max((tilts >> 8) - 90, -90), 90))
+
+    def pos(self, flags, x, y):
+        in_range = bool(flags & (PEN_RANGE | PEN_TOUCH))
+        tool = (BTN_TOOL_RUBBER if flags & PEN_ERASER else BTN_TOOL_PEN) if in_range else None
+        touching, button = bool(flags & PEN_TOUCH) and in_range, bool(flags & PEN_BUTTON) and in_range
+        if tool != self.tool and self.tool is not None:  # tool changed or left: lift it first
+            if self.touching:
+                self.emit(EV_KEY, BTN_TOUCH, 0)
+                self.emit(EV_ABS, ABS_PRESSURE, 0)
+                self.touching = False
+            if self.button:
+                self.emit(EV_KEY, BTN_STYLUS, 0)
+                self.button = False
+            self.emit(EV_KEY, self.tool, 0)
+            self.emit(EV_SYN, 0, 0)
+            self.tool = None
+        if tool is None:
+            return
+        self.emit(EV_ABS, ABS_X, x)
+        self.emit(EV_ABS, ABS_Y, y)
+        self.emit(EV_ABS, ABS_TILT_X, self.tilt[0])
+        self.emit(EV_ABS, ABS_TILT_Y, self.tilt[1])
+        self.emit(EV_ABS, ABS_PRESSURE, self.pressure if touching else 0)
+        if self.tool is None:
+            self.emit(EV_KEY, tool, 1)
+            self.tool = tool
+        if touching != self.touching:
+            self.emit(EV_KEY, BTN_TOUCH, int(touching))
+            self.touching = touching
+        if button != self.button:
+            self.emit(EV_KEY, BTN_STYLUS, int(button))
+            self.button = button
+        self.emit(EV_SYN, 0, 0)
+
+    def close(self):
+        try:
+            self.pos(0, 0, 0)
+        finally:
+            self.destroy()
+
+
+class Mouse(UInput):
+    """Relative pointer for trackpad mode (moves the cursor on every monitor, like a laptop touchpad)."""
+    BUTTONS = (BTN_LEFT, BTN_RIGHT, BTN_MIDDLE)
+
+    def __init__(self):
+        def setup(io):
+            for ev in (EV_SYN, EV_KEY, EV_REL):
+                io(UI_SET_EVBIT, ev)
+            for key in self.BUTTONS:
+                io(UI_SET_KEYBIT, key)
+            for rel in (REL_X, REL_Y, REL_WHEEL, REL_HWHEEL, REL_WHEEL_HI_RES, REL_HWHEEL_HI_RES):
+                io(UI_SET_RELBIT, rel)
+
+        super().__init__(MOUSE_NAME, 0x787A, setup)
+        self.down = set()
+        self.wheel_acc = [0, 0]  # hi-res remainder for the legacy wheel events (vertical, horizontal)
+
+    def move(self, dx, dy):
+        if dx:
+            self.emit(EV_REL, REL_X, dx)
+        if dy:
+            self.emit(EV_REL, REL_Y, dy)
+        self.emit(EV_SYN, 0, 0)
+
+    def button(self, which, pressed):
+        if which >= len(self.BUTTONS):
+            return
+        code = self.BUTTONS[which]
+        if pressed == (code in self.down):
+            return
+        (self.down.add if pressed else self.down.discard)(code)
+        self.emit(EV_KEY, code, int(pressed))
+        self.emit(EV_SYN, 0, 0)
+
+    def scroll(self, dx, dy):
+        for i, (v, hi, lo) in enumerate(((-dy, REL_WHEEL_HI_RES, REL_WHEEL), (dx, REL_HWHEEL_HI_RES, REL_HWHEEL))):
+            if not v:
+                continue
+            self.emit(EV_REL, hi, v)
+            self.wheel_acc[i] += v
+            notches = int(self.wheel_acc[i] / 120)
+            if notches:
+                self.emit(EV_REL, lo, notches)
+                self.wheel_acc[i] -= notches * 120
+        self.emit(EV_SYN, 0, 0)
+
+    def close(self):
+        try:
+            for i in range(len(self.BUTTONS)):
+                self.button(i, False)
+        finally:
+            self.destroy()
+
+
 def _us_keymap():
     """char -> (evdev keycode, needs shift) for the US layout."""
     m = {}
@@ -544,10 +685,23 @@ class Keyboard(UInput):
             self.destroy()
 
 
-def map_touch_to_output():
-    lua = f'hl.device({{ name = "{TOUCH_NAME}", output = "{OUTPUT}" }})'
+def run_lua_or_legacy(lua, *legacy):
+    """hyprctl eval <lua> on the Lua config; the legacy hyprctl command otherwise."""
     if run("hyprctl", "eval", lua, check=False).strip() != "ok":
-        run("hyprctl", "keyword", f"device[{TOUCH_NAME}]:output", OUTPUT, check=False)
+        run("hyprctl", *legacy, check=False)
+
+
+def map_touch_to_output():
+    run_lua_or_legacy(f'hl.device({{ name = "{TOUCH_NAME}", output = "{OUTPUT}" }})',
+                      "keyword", f"device[{TOUCH_NAME}]:output", OUTPUT)
+
+
+def switch_workspace(step):
+    """Trackpad 3-finger swipe: next/previous existing workspace."""
+    rel = "e+1" if step > 0 else "e-1"
+    out = run("hyprctl", "dispatch", f'hl.dsp.focus({{ workspace = "{rel}" }})', check=False)
+    if out.strip() != "ok":
+        run("hyprctl", "dispatch", "workspace", rel, check=False)
 
 
 # --------------------------------------------------------------------- daemon
@@ -569,6 +723,15 @@ class Session:
         self.dirty_at = None  # monotonic time of the last change not yet applied
         self.last_restart = 0.0
         self.sent = False  # any frame reached the phone (set even if the session then fails)
+        # Adaptive quality: 0 = as configured, 1 = lower quality, 2 = lower quality and at most 30 fps.
+        self.adaptive = False
+        self.level = 0
+        self.window_start = time.monotonic()
+        self.busy = 0.0  # seconds spent in sendall during the current window
+        self.calm = 0  # consecutive quiet windows
+        self.calm_needed = 4  # quiet windows before stepping up; doubles when a step up fails
+        self.last_adapt = 0.0
+        self.last_up = -1e9
 
     def read_initial(self, sock, wait=0.3):
         """Collect the control messages a 0.3.0+ phone sends right after OK. Returns leftover bytes."""
@@ -629,6 +792,44 @@ class Session:
     def key(self):
         return (self.w, self.h, self.fps, self.scale(), self.codec())
 
+    def eff_fps(self):
+        return min(self.fps, 30) if self.level >= 2 else self.fps
+
+    def qp(self):
+        return min(int(self.cfg["qp"]) + (0, 6, 12)[self.level], 51)
+
+    def reset_window(self, delay=0.0):
+        """Start a new measuring window (after `delay` s, e.g. to skip a new stream's first keyframe)."""
+        self.window_start, self.busy = time.monotonic() + delay, 0.0
+
+    def count_busy(self, t0, t1):
+        if t0 >= self.window_start:
+            self.busy += t1 - t0
+
+    def adapt_due(self):
+        """Every 3 s: if sending blocked most of the time the link is saturated, step down at once.
+        Step back up only after a run of quiet windows (and 10 s after any change); if the link
+        saturates again soon after stepping up, wait twice as long next time."""
+        now = time.monotonic()
+        span = now - self.window_start
+        if not self.adaptive or span < 3:
+            return False
+        ratio = self.busy / span
+        self.reset_window()
+        self.calm = self.calm + 1 if ratio < 0.2 else 0
+        if ratio > 0.6 and self.level < 2:
+            if now - self.last_up < 30:
+                self.calm_needed = min(self.calm_needed * 2, 40)  # it didn't hold: back off
+            self.level += 1
+        elif self.calm >= self.calm_needed and self.level > 0 and now - self.last_adapt > 10:
+            self.level -= 1
+            self.last_up = now
+        else:
+            return False
+        self.calm = 0
+        self.last_adapt = self.last_restart = now  # shares the restart rate limit with settings changes
+        return True
+
     def scale(self):
         base = self.scale_pref / 100 if self.scale_pref else float(self.cfg["scale"])
         return round(min(max(base * self.res / 100, 0.5), 4.0), 2)  # lower resolution, same layout
@@ -640,7 +841,8 @@ class Session:
         return "hevc" if ok and want in ("auto", "hevc") else "h264"
 
     def describe(self):
-        return f"{self.w}x{self.h}@{self.fps} scale {self.scale()} {self.codec()}"
+        extra = f" (link busy: quality level {self.level})" if self.level else ""
+        return f"{self.w}x{self.h}@{self.eff_fps()} scale {self.scale()} {self.codec()}{extra}"
 
 
 class Pipeline:
@@ -655,7 +857,7 @@ class Pipeline:
 
     def start(self, sock):
         s = self.sess
-        set_monitor(f"{s.w}x{s.h}@{s.fps}", self.cfg["position"], s.scale())
+        set_monitor(f"{s.w}x{s.h}@{s.eff_fps()}", self.cfg["position"], s.scale())
         self.tmp = tempfile.mkdtemp(prefix="hypr-screen-")
         self.fifo = os.path.join(self.tmp, "stream.flv")
         os.mkfifo(self.fifo, 0o600)
@@ -663,13 +865,14 @@ class Pipeline:
         self.frames = queue.Queue(maxsize=8)
         self.codec = s.codec()
         if s.features & F_INFO:  # tell the phone what is coming before the first config frame
-            info = f"{s.w} {s.h} {self.codec}".encode()
+            info = f"{s.w} {s.h} {self.codec} {H_PEN | H_TRACKPAD}".encode()
             sock.settimeout(10)
             sock.sendall(struct.pack(">IBI", len(info), FLAG_INFO, 0) + info)
         with open(os.path.join(self.tmp, "wf-recorder.log"), "w") as errlog:
-            self.rec = subprocess.Popen(recorder_cmd(self.cfg, self.fifo, self.codec, s.fps),
+            self.rec = subprocess.Popen(recorder_cmd(self.cfg, self.fifo, self.codec, s.eff_fps(), s.qp()),
                                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=errlog)
         self.started = time.monotonic()
+        s.reset_window(delay=1.0)  # the new stream starts with a keyframe burst: don't count it
         threading.Thread(target=flv_frames, args=(self.fifo, self.frames, self.stop_event), daemon=True).start()
 
     def alive(self):
@@ -1018,8 +1221,10 @@ class Daemon:
                 sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), val)
 
         sess = Session(self.cfg, w, h)
+        sess.adaptive = via != "USB" and bool(self.cfg.get("adaptive", True))
         pipe = keyboard = None
-        self.touch = None
+        self.touch = self.pen = self.mouse = None
+        self.last_gesture = 0.0
         bye = False
         have_monitor = False
         try:
@@ -1044,9 +1249,10 @@ class Daemon:
         finally:
             if pipe:
                 pipe.stop()
-            if self.touch:
-                quietly(self.touch.close)
-                self.touch = None
+            for dev in ("touch", "pen", "mouse"):
+                if getattr(self, dev):
+                    quietly(getattr(self, dev).close)
+                    setattr(self, dev, None)
             if keyboard:
                 quietly(keyboard.close)
             # Linger only for a working Wi-Fi session that dropped (not Back, not our own failure).
@@ -1095,7 +1301,9 @@ class Daemon:
                 return False
             if frame:
                 sock.settimeout(10)
+                t0 = time.monotonic()
                 sock.sendall(frame)
+                sess.count_busy(t0, time.monotonic())
                 sess.sent = True
             sock.settimeout(0)
             while True:  # drain everything the phone has sent
@@ -1114,15 +1322,25 @@ class Daemon:
                 kind = msg[0]
                 if kind == C_BYE:
                     return True
-                if kind >= C_VIEW:
+                if M_MOVE <= kind <= M_GESTURE:
+                    self.mouse_msg(*msg)
+                elif S_AUX <= kind <= S_POS:
+                    self.pen_msg(*msg)
+                elif C_VIEW <= kind <= C_BYE:
                     sess.control(*msg)
+                elif kind >= 30:
+                    pass  # from a newer phone: ignore
                 elif kind >= K_TAP:
                     if keyboard:
                         keyboard.handle(*msg)
                 elif self.touch:
                     self.touch.handle(*msg)
             buf = buf[n:]
-            if sess.restart_due():
+            if sess.adapt_due():
+                log(f"adapting to the link: {sess.describe()}")
+                pipe.stop()
+                pipe.start(sock)
+            elif sess.restart_due():
                 log(f"reconfiguring: {sess.describe()}")
                 pipe.stop()
                 if self.touch and (self.touch.size != (sess.w, sess.h)):
@@ -1133,6 +1351,42 @@ class Daemon:
                         self.touch = None
                         log(f"touch input unavailable: {e}")
                 pipe.start(sock)
+
+    def pen_msg(self, kind, flags, x, y):
+        if self.pen is None:
+            try:
+                self.pen = Pen()  # created on first use, so phones without a stylus add no device
+            except OSError as e:
+                log(f"pen input unavailable: {e}")
+                self.pen = False
+        if not self.pen:
+            return
+        if kind == S_AUX:
+            self.pen.aux(x, y)
+        else:
+            self.pen.pos(flags, x, y)
+
+    def mouse_msg(self, kind, slot, x, y):
+        if kind == M_GESTURE:
+            now = time.monotonic()
+            if slot in (1, 2) and now - self.last_gesture > 0.3:
+                self.last_gesture = now
+                threading.Thread(target=switch_workspace, args=(1 if slot == 1 else -1,), daemon=True).start()
+            return
+        if self.mouse is None:
+            try:
+                self.mouse = Mouse()
+            except OSError as e:
+                log(f"trackpad input unavailable: {e}")
+                self.mouse = False
+        if not self.mouse:
+            return
+        if kind == M_MOVE:
+            self.mouse.move(s16(x), s16(y))
+        elif kind == M_BTN:
+            self.mouse.button(slot, bool(x))
+        elif kind == M_SCROLL:
+            self.mouse.scroll(s16(x), s16(y))
 
     # ---- UDP discovery for Wi-Fi
     def discovery(self):

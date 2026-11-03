@@ -103,6 +103,17 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     private lateinit var keyCatcher: KeyCatcher
     private lateinit var kbdButton: TextView
+    private lateinit var padButton: TextView
+    /** Trackpad mode: the screen works like a laptop touchpad instead of touching where you tap. */
+    @Volatile private var trackpad = false
+    /** What the laptop supports (from INFO; 0 for laptops before 0.4.0, which get plain touch). */
+    @Volatile private var hostFeatures = 0
+    /** Pointer ids we sent T_DOWN for and haven't released (UI thread only). */
+    private val activeTouches = mutableSetOf<Int>()
+    private var penHovered = false
+    private var lastPenX = 0
+    private var lastPenY = 0
+    private val penExit = Runnable { touchQueue.offer(msg(S_AUX, 0, 0, 90 or (90 shl 8)) + msg(S_POS, 0, lastPenX, lastPenY)) }
     private lateinit var keyBar: LinearLayout
     private var stickyMods = 0
     private val modButtons = mutableMapOf<Int, TextView>()
@@ -134,16 +145,21 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         surfaceView = SurfaceView(this).also {
             it.holder.addCallback(this)
             it.setOnTouchListener { v, e -> onTouch(v, e); true }
+            it.setOnGenericMotionListener { v, e -> onHover(v, e) } // pen hovering above the screen
         }
         home = buildHome()
         keyCatcher = KeyCatcher()
         keyBar = buildKeyBar()
         kbdButton = buildKeyboardButton()
+        padButton = buildPadButton()
         root = FrameLayout(this).apply {
             setBackgroundColor(BG)
             addView(surfaceView, FrameLayout.LayoutParams(-1, -1))
             addView(keyCatcher, FrameLayout.LayoutParams(1, 1))
             addView(keyBar, FrameLayout.LayoutParams(-1, dp(46), Gravity.BOTTOM))
+            addView(padButton, FrameLayout.LayoutParams(dp(48), dp(48), Gravity.BOTTOM or Gravity.END).apply {
+                setMargins(0, 0, dp(76), dp(16))
+            })
             addView(kbdButton, FrameLayout.LayoutParams(dp(48), dp(48), Gravity.BOTTOM or Gravity.END).apply {
                 setMargins(0, 0, dp(16), dp(16))
             })
@@ -158,6 +174,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             keyBar.translationY = -ime.toFloat()
             kbdButton.translationY = if (open) -(ime + dp(46)).toFloat() else 0f
             if (!open && kbdButton.y < 0) kbdButton.translationY = 0f
+            padButton.translationY = kbdButton.translationY
             if (open != imeOpen || ime != imeHeight) {
                 imeOpen = open; imeHeight = ime
                 layoutVideo()
@@ -332,6 +349,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private fun showStream(streaming: Boolean) = runOnUiThread {
         home.visibility = if (streaming) View.GONE else View.VISIBLE
         kbdButton.visibility = if (streaming) View.VISIBLE else View.GONE
+        padButton.visibility = if (streaming && hostFeatures and H_TRACKPAD != 0) View.VISIBLE else View.GONE
+        if (!streaming) { setTrackpad(false); activeTouches.clear() }
         if (!streaming) hideKeyboard()
     }
 
@@ -662,6 +681,27 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
     }
 
+    private fun buildPadButton() = TextView(this).apply {
+        text = "🖱"
+        textSize = 20f
+        gravity = Gravity.CENTER
+        setTextColor(Color.WHITE)
+        background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.parseColor("#99000000")) }
+        alpha = 0.7f
+        visibility = View.GONE
+        contentDescription = "Trackpad mode"
+        setOnClickListener { setTrackpad(!trackpad) }
+    }
+
+    private fun setTrackpad(on: Boolean) = runOnUiThread {
+        if (trackpad && !on) padRelease()
+        if (on) releaseTouches() // a finger resting on the screen must not stay pressed on the laptop
+        trackpad = on
+        (padButton.background as GradientDrawable).setColor(if (on) ACCENT else Color.parseColor("#99000000"))
+        padButton.setTextColor(if (on) Color.BLACK else Color.WHITE)
+        padButton.alpha = if (on) 0.9f else 0.7f
+    }
+
     private fun buildKeyBar(): LinearLayout {
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -696,14 +736,173 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     // ---------------------------------------------------------------- touch
 
     /** Encode one MotionEvent as touch messages: type, slot, x, y (0..65535) + sync. */
+    /** Index of the stylus pointer in this event, or -1 (also -1 if the laptop has no pen support). */
+    private fun penIndex(e: MotionEvent): Int {
+        if (hostFeatures and H_PEN == 0) return -1
+        for (i in 0 until e.pointerCount) {
+            val t = e.getToolType(i)
+            if (t == MotionEvent.TOOL_TYPE_STYLUS || t == MotionEvent.TOOL_TYPE_ERASER) return i
+        }
+        return -1
+    }
+
+    private fun onHover(v: View, e: MotionEvent): Boolean {
+        val pi = penIndex(e)
+        if (!streaming || pi < 0) return false
+        penHovered = true
+        when (e.actionMasked) {
+            MotionEvent.ACTION_HOVER_ENTER, MotionEvent.ACTION_HOVER_MOVE -> {
+                surfaceView.removeCallbacks(penExit)
+                sendPen(v, e, pi, touching = false, inRange = true)
+            }
+            // Android sends HOVER_EXIT right before the pen touches down: only leave range if no touch follows.
+            MotionEvent.ACTION_HOVER_EXIT -> surfaceView.postDelayed(penExit, 120)
+            else -> return false
+        }
+        return true
+    }
+
+    /** Lift every finger the laptop thinks is down (pen arrived, or trackpad mode switched on). */
+    private fun releaseTouches() {
+        if (activeTouches.isEmpty()) return
+        val buf = ByteBuffer.allocate((activeTouches.size + 1) * 6)
+        for (id in activeTouches) buf.put(msg(T_UP, id, 0, 0))
+        buf.put(msg(T_SYNC, 0, 0, 0))
+        activeTouches.clear()
+        touchQueue.offer(buf.array())
+    }
+
+    /** Stylus: absolute position plus pressure, tilt, eraser and side button. */
+    private fun sendPen(v: View, e: MotionEvent, i: Int, touching: Boolean, inRange: Boolean) {
+        if (v.width == 0 || v.height == 0) return
+        var flags = 0
+        if (touching) flags = flags or PEN_TOUCH
+        if (inRange) flags = flags or PEN_RANGE
+        if (e.getToolType(i) == MotionEvent.TOOL_TYPE_ERASER) flags = flags or PEN_ERASER
+        if (e.buttonState and (MotionEvent.BUTTON_STYLUS_PRIMARY or MotionEvent.BUTTON_SECONDARY) != 0) flags = flags or PEN_BUTTON
+        val x = (e.getX(i) / v.width * 65535f).toInt().coerceIn(0, 65535)
+        val y = (e.getY(i) / v.height * 65535f).toInt().coerceIn(0, 65535)
+        lastPenX = x; lastPenY = y
+        val pressure = (e.getPressure(i).coerceIn(0f, 1f) * 65535f).toInt()
+        val tiltDeg = Math.toDegrees(e.getAxisValue(MotionEvent.AXIS_TILT, i).toDouble())
+        val orient = e.getAxisValue(MotionEvent.AXIS_ORIENTATION, i).toDouble()
+        val tx = (tiltDeg * Math.sin(orient)).toInt().coerceIn(-90, 90) + 90
+        val ty = (-tiltDeg * Math.cos(orient)).toInt().coerceIn(-90, 90) + 90
+        val moving = e.actionMasked == MotionEvent.ACTION_MOVE || e.actionMasked == MotionEvent.ACTION_HOVER_MOVE
+        if (moving && touchQueue.size > 64) return
+        touchQueue.offer(msg(S_AUX, 0, pressure, tx or (ty shl 8)) + msg(S_POS, flags, x, y))
+    }
+
+    // ---- trackpad mode
+    private var padLastX = 0f
+    private var padLastY = 0f
+    private var padCount = 0
+    private var padMaxCount = 0
+    private var padDownAt = 0L
+    private var padMoved = 0f
+    private var padDragging = false
+    private var padSwipeStartX = 0f
+    private var padSwipeDone = false
+    private var padAccX = 0f
+    private var padAccY = 0f
+    private val padLongPress = Runnable {
+        if (trackpad && padCount == 1 && padMoved < ViewConfiguration.get(this).scaledTouchSlop) {
+            padDragging = true // hold, then move: drag with the left button held
+            touchQueue.offer(msg(M_BTN, 0, 1, 0))
+        }
+    }
+
+    private fun padRelease() {
+        surfaceView.removeCallbacks(padLongPress)
+        if (padDragging) touchQueue.offer(msg(M_BTN, 0, 0, 0))
+        padDragging = false
+    }
+
+    private fun onTrackpad(e: MotionEvent) {
+        val skip = if (e.actionMasked == MotionEvent.ACTION_POINTER_UP) e.actionIndex else -1
+        var cx = 0f; var cy = 0f; var n = 0
+        for (i in 0 until e.pointerCount) if (i != skip) { cx += e.getX(i); cy += e.getY(i); n++ }
+        if (n > 0) { cx /= n; cy /= n }
+        val density = resources.displayMetrics.density
+        val slop = ViewConfiguration.get(this).scaledTouchSlop
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                padRelease()
+                padDownAt = SystemClock.uptimeMillis(); padMoved = 0f; padMaxCount = 1; padCount = 1
+                padLastX = cx; padLastY = cy; padAccX = 0f; padAccY = 0f
+                surfaceView.postDelayed(padLongPress, 450)
+            }
+            MotionEvent.ACTION_POINTER_DOWN, MotionEvent.ACTION_POINTER_UP -> {
+                padCount = n; padMaxCount = maxOf(padMaxCount, e.pointerCount)
+                padLastX = cx; padLastY = cy; padAccX = 0f; padAccY = 0f // re-base: no jump
+                surfaceView.removeCallbacks(padLongPress)
+                if (n >= 3) { padSwipeStartX = cx; padSwipeDone = false }
+            }
+            MotionEvent.ACTION_MOVE -> {
+                val dx = cx - padLastX; val dy = cy - padLastY
+                padLastX = cx; padLastY = cy
+                padMoved += Math.abs(dx) + Math.abs(dy)
+                if (padMoved > slop) surfaceView.removeCallbacks(padLongPress)
+                when {
+                    padMaxCount >= 3 -> if (n >= 3 && !padSwipeDone && Math.abs(cx - padSwipeStartX) > 90 * density) {
+                        padSwipeDone = true // swipe left = next workspace, like a laptop touchpad
+                        touchQueue.offer(msg(M_GESTURE, if (cx < padSwipeStartX) 1 else 2, 0, 0))
+                    } // 3-finger touch: no pointer moves or scrolling, even while fingers lift one by one
+                    n == 1 -> {
+                        padAccX += dx / density * 1.6f; padAccY += dy / density * 1.6f
+                        val mx = padAccX.toInt().coerceIn(-32000, 32000); val my = padAccY.toInt().coerceIn(-32000, 32000)
+                        if (mx != 0 || my != 0) {
+                            padAccX -= mx; padAccY -= my
+                            if (touchQueue.size < 64) touchQueue.offer(msg(M_MOVE, 0, mx, my))
+                        }
+                    }
+                    n == 2 -> { // natural scrolling: content follows the fingers; 120 = one wheel notch per 24 dp
+                        padAccX += -dx / density * 5f; padAccY += -dy / density * 5f
+                        val sx = padAccX.toInt().coerceIn(-32000, 32000); val sy = padAccY.toInt().coerceIn(-32000, 32000)
+                        if (sx != 0 || sy != 0) {
+                            padAccX -= sx; padAccY -= sy
+                            touchQueue.offer(msg(M_SCROLL, 0, sx, sy))
+                        }
+                    }
+                }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                val wasDragging = padDragging
+                padRelease()
+                val quick = SystemClock.uptimeMillis() - padDownAt < 300 && padMoved < slop * 2
+                if (!wasDragging && quick && e.actionMasked == MotionEvent.ACTION_UP && !padSwipeDone) {
+                    val button = when (padMaxCount) { 1 -> 0; 2 -> 1; else -> 2 } // tap / 2-finger / 3-finger
+                    touchQueue.offer(msg(M_BTN, button, 1, 0) + msg(M_BTN, button, 0, 0))
+                }
+                padCount = 0; padSwipeDone = false
+            }
+        }
+    }
+
     private fun onTouch(v: View, e: MotionEvent) {
         if (!streaming || v.width == 0 || v.height == 0) return
+        val pi = penIndex(e)
+        if (pi >= 0) { // the pen wins: fingers (a resting palm) are ignored while it is on the screen
+            releaseTouches()
+            surfaceView.removeCallbacks(penExit)
+            val penAction = e.actionIndex == pi
+            when (e.actionMasked) {
+                MotionEvent.ACTION_CANCEL -> sendPen(v, e, pi, touching = false, inRange = false)
+                MotionEvent.ACTION_UP -> sendPen(v, e, pi, touching = false, inRange = penHovered)
+                MotionEvent.ACTION_POINTER_UP -> if (penAction) sendPen(v, e, pi, touching = false, inRange = penHovered)
+                MotionEvent.ACTION_POINTER_DOWN -> if (penAction) sendPen(v, e, pi, touching = true, inRange = true)
+                else -> sendPen(v, e, pi, touching = true, inRange = true) // DOWN, MOVE
+            }
+            return
+        }
+        if (trackpad) { onTrackpad(e); return }
         val buf = ByteBuffer.allocate((e.pointerCount + 2) * 6)
         fun put(type: Int, i: Int) {
             val id = e.getPointerId(i)
             if (id >= 10) return
             val x = (e.getX(i) / v.width * 65535f).toInt().coerceIn(0, 65535)
             val y = (e.getY(i) / v.height * 65535f).toInt().coerceIn(0, 65535)
+            if (type == T_DOWN) activeTouches.add(id) else if (type == T_UP) activeTouches.remove(id)
             buf.put(type.toByte()).put(id.toByte()).putShort(x.toShort()).putShort(y.toShort())
         }
         when (e.actionMasked) {
@@ -936,6 +1135,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         s.outputStream.apply { write(controls); flush() }
         streamW = w; streamH = h
         mime = MediaFormat.MIMETYPE_VIDEO_AVC
+        hostFeatures = 0
         s.soTimeout = 0
         setStatus("Connected to ${l.name}")
         touchQueue.clear()
@@ -977,6 +1177,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                     val ih = p.getOrNull(1)?.toIntOrNull() ?: continue
                     streamW = iw; streamH = ih
                     mime = if (p.getOrNull(2) == "hevc") MediaFormat.MIMETYPE_VIDEO_HEVC else MediaFormat.MIMETYPE_VIDEO_AVC
+                    hostFeatures = p.getOrNull(3)?.toIntOrNull() ?: 0
                     decoder?.release()
                     decoder = null
                     layoutVideo()
@@ -1107,6 +1308,18 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         private const val P_CODEC = 3
         private const val P_RES = 4
         private const val RECONNECT_MS = 20_000L
+        private const val S_AUX = 30
+        private const val S_POS = 31
+        private const val PEN_TOUCH = 1
+        private const val PEN_ERASER = 2
+        private const val PEN_BUTTON = 4
+        private const val PEN_RANGE = 8
+        private const val M_MOVE = 40
+        private const val M_BTN = 41
+        private const val M_SCROLL = 42
+        private const val M_GESTURE = 43
+        private const val H_PEN = 1
+        private const val H_TRACKPAD = 2
         private const val T_SYNC = 0
         private const val T_DOWN = 1
         private const val T_MOVE = 2

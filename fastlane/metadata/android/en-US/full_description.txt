@@ -8,6 +8,8 @@ Hypr Screen turns your Android phone into a real extra monitor for the <b>Hyprla
 <li><b>Portrait or landscape:</b> pick an orientation or let the monitor auto-rotate with the phone.</li>
 <li><b>Display settings:</b> resolution, frame rate (battery saver), text size and video codec (HEVC or H.264).</li>
 <li><b>Touch:</b> tap, drag and scroll on the phone.</li>
+<li><b>Stylus:</b> pressure, tilt, eraser and hover, for drawing apps such as Krita.</li>
+<li><b>Trackpad mode:</b> use the phone as a touchpad for the whole desktop, with gestures.</li>
 <li><b>Keyboard:</b> type with the phone keyboard. An extra row gives Esc, Tab, Ctrl, Alt, Super and arrow keys. A Bluetooth keyboard paired to the phone works too.</li>
 <li><b>Low latency:</b> hardware H.264 encoding on the laptop and hardware decoding on the phone.</li>
 <li><b>Secure:</b> every connection uses TLS 1.3 with a pinned certificate and a per-device pairing key.</li>
