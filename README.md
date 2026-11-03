@@ -72,7 +72,7 @@ Either way, this starts the `hypr-screen` systemd user service, which comes up w
 Install the app in one of these ways:
 
 - **Obtainium:** add `https://github.com/kpanuragh/hypr-screen` to get the APK from each new release, with updates.
-- **F-Droid / IzzyOnDroid:** coming soon.
+- **F-Droid:** planned. F-Droid only accepts apps that have been maintained for 3 months, so the request goes in from February 2027. The F-Droid metadata is already in this repo.
 - **Direct download:** `hypr-screen-*.apk` from [Releases](../../releases), or `adb install hypr-screen-*.apk`.
 - **Build it yourself** (see below).
 
