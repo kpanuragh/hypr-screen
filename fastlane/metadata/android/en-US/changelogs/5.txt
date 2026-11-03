@@ -1,0 +1,6 @@
+* Mirror mode: show a copy of the laptop screen instead of an extra monitor (Mode setting)
+* Auto-connect: opening the app connects to the last laptop as soon as it is found
+* Quick Settings tile to connect from anywhere
+* Paired laptops list with Forget
+* The laptop can end the session (hypr-screen --disconnect) and the phone stays disconnected
+* Laptop: per-phone position and workspaces, a status widget for Waybar and the Omarchy bar, and a shortcut to move the focused window to the phone

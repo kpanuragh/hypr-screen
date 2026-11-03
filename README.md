@@ -11,11 +11,14 @@ Plug the phone in over USB and it becomes a real Hyprland output next to your la
 
 ## Features
 
-- **Extended display, not a mirror.** Hyprland gets a real (headless) monitor at the phone's native resolution, with its own workspaces and bar.
+- **Extended display, or a mirror.** Hyprland gets a real (headless) monitor at the phone's native resolution, with its own workspaces and bar. Or set **Mode → Mirror** on the phone to show a copy of your laptop screen, for example to show someone what you are doing.
+- **Your workspaces, per phone.** Pick workspaces that always open on the phone (say, chat and music on 8 and 9), and a position for each phone.
 - **Low-latency video.** Frames are captured with `wf-recorder`, hardware-encoded (VAAPI) and hardware-decoded on the phone. HEVC is used when both sides support it (about half the bandwidth of H.264). Only changed frames are sent, so an idle desktop uses almost no bandwidth.
 - **Portrait or landscape.** Choose an orientation, or let the monitor auto-rotate with the phone. Hyprland gets a real portrait monitor, not a rotated picture.
 - **Display settings on the phone.** Resolution, frame rate (a 50% / 30 fps battery saver), text size and codec.
 - **Plug-and-play USB.** A background service notices the phone, opens the app and connects. Nothing to run by hand.
+- **One tap on the phone.** Opening the app connects to the laptop you used last as soon as it is found on your network. A Quick Settings tile does the same from anywhere.
+- **Bar widget and shortcuts.** Show the connection in Waybar or the Omarchy bar, end it from the laptop, and send the focused window to the phone with a key.
 - **Wi-Fi (opt-in).** The app discovers your laptop on the local network. Pair once by tapping **Pair** and accepting on the laptop (like Bluetooth), or just plug in USB once. On a slow network, quality and then frame rate step down automatically and come back when it recovers. If Wi-Fi drops, the phone reconnects by itself, and the laptop keeps its monitor (and your windows on it) for 15 seconds.
 - **Secure by default.** Every connection is TLS 1.3 with a pinned certificate, and the phone must prove it holds its pairing key.
 - **Multitouch.** A virtual touchscreen is mapped onto the phone's monitor, so you can tap, drag, scroll and pinch.
@@ -88,9 +91,43 @@ Release APKs are signed with this certificate (SHA-256):
   ```
   Open the app on the same network and tap **Pair** next to your laptop. The phone shows a 6-digit code and a window opens on the laptop: type the code there, press **Enter**, then tap **Confirm** on the phone. After that, tap **Connect** whenever you want the extra monitor.
 
-  Manage Wi-Fi-paired phones with `hypr-screen --devices` and `hypr-screen --forget <id>` (a phone that is connected at that moment stays connected until it disconnects).
+  Manage Wi-Fi-paired phones with `hypr-screen --devices` and `hypr-screen --forget <id>` (this also ends its session if it is connected). On the phone, **Paired laptops** in the settings lists your laptops, with **Forget**.
 
 On the phone, the **⌨** button opens the keyboard (drag it to move it). **Back** closes the keyboard; pressing Back again disconnects.
+
+To connect from anywhere on the phone, add the **Hypr Screen** tile: pull down Quick Settings, tap the edit (pencil) button and drag the tile in. Tapping it opens the app and connects to the last laptop. Turn off **Auto-connect** in the app if you'd rather tap **Connect** yourself.
+
+### 4. Laptop shortcuts and bar widget
+
+```sh
+hypr-screen --status        # JSON for Waybar / the Omarchy bar
+hypr-screen --disconnect    # end the session (the phone doesn't reconnect)
+hypr-screen --move-window   # send the focused window to the phone
+```
+
+Bind a key to move windows. On Omarchy, add this to `~/.config/hypr/bindings.lua`:
+
+```lua
+o.bind("SUPER + SHIFT + P", "Move window to phone", "hypr-screen --move-window")
+```
+
+**Omarchy bar:** add a module to a section of `bar.layout` in `~/.config/omarchy/shell.json`, for example next to the clock:
+
+```json
+{ "id": "hypr-screen", "type": "command", "exec": "hypr-screen --status", "interval": 5,
+  "tooltip": "Phone display", "onClick": "hypr-screen --disconnect" }
+```
+
+**Waybar:**
+
+```json
+"custom/hypr-screen": {
+  "exec": "hypr-screen --status", "return-type": "json", "interval": 5,
+  "on-click": "hypr-screen --disconnect"
+}
+```
+
+The widget shows a phone icon while a phone is connected (class `connected` or `mirror`) and nothing otherwise (`idle`, or `stopped` when the service isn't running).
 
 ## Configuration
 
@@ -109,6 +146,17 @@ On the phone, the **⌨** button opens the keyboard (drag it to move it). **Back
 | `wifi_pairing` | `true` | Allow pairing requests over Wi-Fi (they still need your approval) |
 | `codec` | `"auto"` | `auto` (HEVC when the phone supports it), `h264` or `hevc` |
 | `adaptive` | `true` | On Wi-Fi, lower quality/frame rate while the link can't keep up |
+| `workspaces` | `[]` | Workspaces to put on the phone while it is connected, e.g. `[8, 9]` or `["name:chat"]` |
+| `mirror_output` | `""` | Monitor shown in mirror mode (`""` = the focused one), e.g. `"eDP-1"` |
+| `phones` | `{}` | Per-phone `position` and `workspaces`, keyed by the id from `--devices` (or `"usb"`) |
+
+Example for a phone that sits below the laptop screen and gets workspace 9:
+
+```json
+"phones": { "3f9a1c2b7d10": { "position": "auto-down", "workspaces": [9] } }
+```
+
+Workspace rules stay in Hyprland until it reloads its config, so after removing a workspace from this list, reload Hyprland (or log out and in).
 
 The phone's own Display settings (resolution, frame rate, text size, codec) override `fps` and `scale` for that phone. Restart after editing: `systemctl --user restart hypr-screen`. Logs: `journalctl --user -u hypr-screen -f`.
 
@@ -150,6 +198,7 @@ This needs JDK 17+ and the Android SDK (platform 36), with the SDK path in `ANDR
 - A floating phone keyboard still floats over the picture (drag it aside, or use a docked keyboard, which the picture shrinks to make room for).
 - Characters outside the US layout are typed through `wtype`, one at a time.
 - No audio. Audio keeps playing on the laptop.
+- Mirror mode sends the mirrored monitor at its full resolution (up to 4096 pixels wide); the phone's Resolution setting doesn't apply to it.
 - Tested on: Omarchy, Hyprland 0.56, Intel Iris Xe, OnePlus (Android 17). Reports from other setups are welcome.
 
 ## License

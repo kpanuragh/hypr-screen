@@ -95,8 +95,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private val session = AtomicReference<Socket?>(null)
     private val sessionClaim = AtomicReference<Any?>(null)
     @Volatile private var autoUsb = false
+    @Volatile private var autoLast = false // connect to the last laptop once it shows up (app opened / tile)
     @Volatile private var visible = false
     private var found = listOf<Laptop>()
+    private var refreshPairCount: () -> Unit = {}
+    @Volatile private var lastLaptopId: String? = null
     /** Touch messages waiting to be written to the laptop (one batch per MotionEvent). */
     private val touchQueue = LinkedBlockingQueue<ByteArray>() // unbounded: releases are never dropped
     @Volatile private var streaming = false
@@ -186,12 +189,14 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
         applyOrientation()
         autoUsb = intent?.getBooleanExtra(EXTRA_AUTO_USB, false) == true
+        if (intent?.getBooleanExtra(EXTRA_AUTO_LAST, false) == true) autoLast = true
         thread(name = "discovery", isDaemon = true) { discoveryLoop() }
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         if (intent.getBooleanExtra(EXTRA_AUTO_USB, false)) autoUsb = true
+        if (intent.getBooleanExtra(EXTRA_AUTO_LAST, false) && sessionClaim.get() == null) autoLast = true
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -202,8 +207,13 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
     }
 
-    override fun onStart() { super.onStart(); visible = true }
-    override fun onStop() { visible = false; super.onStop() }
+    override fun onStart() {
+        super.onStart()
+        visible = true
+        // Opening the app reconnects to the last laptop (not while a session is already running).
+        if (settings.getInt("auto", 1) == 1 && sessionClaim.get() == null) autoLast = true
+    }
+    override fun onStop() { visible = false; autoLast = false; super.onStop() }
 
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
@@ -219,6 +229,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     /** Back/explicit disconnect: tell the laptop it's on purpose (no reconnect grace), then close. */
     private fun disconnect() {
         userStop = true
+        autoLast = false
         val s = session.get() ?: return
         if (streaming) {
             touchQueue.offer(msg(C_BYE, 0, 0, 0))
@@ -313,13 +324,15 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             Opt("Text size", "scale", listOf(0, 100, 125, 150, 200), listOf("Laptop default", "100%", "125%", "150%", "200%"), 0),
             Opt("Video codec", "codec", listOf(0, 1),
                 listOf(if (hevcDecoder) "Auto (HEVC)" else "Auto (H.264)", "H.264 only"), 0),
+            Opt("Mode", "mode", listOf(0, 1), listOf("Extra monitor", "Mirror laptop screen"), 0),
+            Opt("Auto-connect", "auto", listOf(1, 0), listOf("Last laptop, when found", "Off"), 1),
         )
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = GradientDrawable().apply { cornerRadius = dp(14).toFloat(); setColor(CARD) }
             setPadding(dp(18), dp(6), dp(18), dp(6))
         }
-        fun row(label: String, value: () -> String, onTap: () -> Unit) {
+        fun row(label: String, value: () -> String, onTap: () -> Unit): TextView {
             val v = TextView(this).apply { textSize = 15f; setTextColor(ACCENT); text = value() }
             panel.addView(LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
@@ -330,6 +343,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 addView(v)
                 setOnClickListener { onTap(); v.text = value() }
             })
+            return v
         }
         for (o in opts) {
             fun cur() = settings.getInt(o.key, o.def).let { if (it in o.values) it else o.def }
@@ -343,7 +357,39 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             settings.edit().putInt("orient", (settings.getInt("orient", 0).coerceIn(0, 2) + 1) % 3).apply()
             applyOrientation() // while connected, the laptop's monitor follows
         }
+        val pairCount = { allPairings().size.let { if (it == 1) "1 laptop" else "$it laptops" } }
+        val countView = row("Paired laptops", pairCount) { showPairings() }
+        refreshPairCount = { countView.text = pairCount() }
         return panel
+    }
+
+    /** List of laptops this phone can connect to, with Forget. */
+    private fun showPairings() {
+        val pairs = allPairings().sortedBy { it.name }
+        if (pairs.isEmpty()) {
+            AlertDialog.Builder(this).setTitle("Paired laptops").setMessage("No laptops paired yet.")
+                .setPositiveButton("OK", null).show()
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Paired laptops")
+            .setItems(pairs.map { "${it.name}  ·  ${if (it.device == null) "USB" else "Wi-Fi"}" }.toTypedArray()) { _, i ->
+                val p = pairs[i]
+                AlertDialog.Builder(this)
+                    .setTitle("Forget ${p.name}?")
+                    .setMessage("This phone won't connect to ${p.name} until you pair again." +
+                        if (p.device != null) "\n\nOn the laptop, also run: hypr-screen --forget ${p.device}" else "")
+                    .setPositiveButton("Forget") { _, _ ->
+                        prefs.edit().remove("pair_${p.id}").apply()
+                        if (settings.getString("last", null) == p.id) settings.edit().remove("last").apply()
+                        found = emptyList() // redraw the list (Pair instead of Connect)
+                        refreshPairCount()
+                    }
+                    .setNegativeButton("Cancel", null)
+                    .show()
+            }
+            .setNegativeButton("Close", null)
+            .show()
     }
 
     private fun showStream(streaming: Boolean) = runOnUiThread {
@@ -355,6 +401,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     private fun renderList(laptops: List<Laptop>) = runOnUiThread {
+        refreshPairCount() // pairings can arrive by USB or Wi-Fi pairing
         if (laptops == found && list.childCount > 0) return@runOnUiThread
         found = laptops
         list.removeAllViews()
@@ -450,6 +497,12 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 if (autoUsb && usb != null && surfaceReady) {
                     autoUsb = false
                     runOnUiThread { connect(usb) }
+                }
+                val last = settings.getString("last", null)
+                val lastLaptop = laptops.firstOrNull { it.id == last && (it.usb || pairing(it.id) != null) }
+                if (autoLast && lastLaptop != null && surfaceReady && session.get() == null) {
+                    autoLast = false
+                    runOnUiThread { connect(lastLaptop) }
                 }
             }
             Thread.sleep(1500)
@@ -922,6 +975,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private fun connect(l: Laptop) {
         val token = Any()
         if (!sessionClaim.compareAndSet(null, token)) return // already connecting/streaming
+        autoLast = false; autoUsb = false // auto-connect happens once per opening of the app
         userStop = false
         thread(name = "session", isDaemon = true) {
             var reconnectUntil = 0L
@@ -1090,6 +1144,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     private fun runSession(l: Laptop) {
         setStatus("Connecting to ${l.name}…")
+        lastLaptopId = l.id
         val p = pairing(l.id) ?: error("Pair with ${l.name} first")
         val s = tlsConnect(l.host, setOf(p.fingerprint), 3000)
         session.set(s)
@@ -1123,13 +1178,14 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
         if (!surfaceReady) error("Screen not ready")
         // 0.3.0 laptops: our features, preferences and the monitor size we want (older ones ignore these).
-        val features = F_INFO or (if (hevcDecoder) F_HEVC else 0)
-        val controls = ByteBuffer.allocate(6 * 6).apply {
+        val features = F_INFO or F_BYE or (if (hevcDecoder) F_HEVC else 0)
+        val controls = ByteBuffer.allocate(7 * 6).apply {
             put(msg(C_HELLO, 0, features, 0))
             put(msg(C_PREF, P_FPS, settings.getInt("fps", 0), 0))
             put(msg(C_PREF, P_SCALE, settings.getInt("scale", 0), 0))
             put(msg(C_PREF, P_CODEC, settings.getInt("codec", 0), 0))
             put(msg(C_PREF, P_RES, settings.getInt("res", 100), 0))
+            put(msg(C_PREF, P_MODE, settings.getInt("mode", 0), 0))
             viewSize().let { (vw, vh) -> put(msg(C_VIEW, 0, vw, vh)) }
         }.array()
         s.outputStream.apply { write(controls); flush() }
@@ -1171,6 +1227,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 if (len < 0 || len > 64 shl 20) error("Bad frame")
                 if (len > buf.size) buf = ByteArray(len)
                 input.readFully(buf, 0, len)
+                if (flags and FLAG_BYE != 0) error("Disconnected from the laptop") // on purpose: don't reconnect
                 if (flags and FLAG_INFO != 0) { // new stream follows: "<w> <h> <h264|hevc>"
                     val p = String(buf, 0, minOf(len, 64)).trim().split(" ")
                     val iw = p.getOrNull(0)?.toIntOrNull() ?: continue
@@ -1187,6 +1244,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                     if (flags and FLAG_CONFIG == 0) continue // wait for SPS/PPS
                     decoder = Decoder(surfaceView.holder.surface, streamW, streamH, mime)
                     streamedThisAttempt = true // a picture arrived: worth reconnecting if this drops
+                    lastLaptopId?.let { settings.edit().putString("last", it).apply() }
                     showStream(true)
                     layoutVideo()
                 }
@@ -1297,16 +1355,20 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         private const val FLAG_CONFIG = 1
         private const val FLAG_KEY = 2
         private const val FLAG_INFO = 4
+        private const val FLAG_BYE = 8
+        const val EXTRA_AUTO_LAST = "autoconnect_last"
         private const val C_VIEW = 20
         private const val C_PREF = 21
         private const val C_HELLO = 22
         private const val C_BYE = 23
         private const val F_INFO = 1
         private const val F_HEVC = 2
+        private const val F_BYE = 4
         private const val P_FPS = 1
         private const val P_SCALE = 2
         private const val P_CODEC = 3
         private const val P_RES = 4
+        private const val P_MODE = 5
         private const val RECONNECT_MS = 20_000L
         private const val S_AUX = 30
         private const val S_POS = 31
