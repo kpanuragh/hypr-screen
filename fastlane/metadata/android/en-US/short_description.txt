@@ -1,0 +1,1 @@
+Use your phone as an extra Hyprland monitor, with touch and keyboard

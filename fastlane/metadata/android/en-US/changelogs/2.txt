@@ -1,0 +1,3 @@
+* Pair over Wi-Fi without a USB cable: tap Pair and type the code shown on the phone into the window on the laptop
+* Each Wi-Fi phone gets its own key, and can be removed on the laptop with hypr-screen --forget
+* Fix: phones paired over Wi-Fi now show Connect instead of asking for USB

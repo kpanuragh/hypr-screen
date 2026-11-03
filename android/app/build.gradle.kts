@@ -17,8 +17,8 @@ android {
         applicationId = "com.hyprscreen"
         minSdk = 30
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.2.0"
     }
     signingConfigs {
         if (keystoreProps != null) create("release") {
@@ -34,6 +34,11 @@ android {
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
             if (keystoreProps != null) signingConfig = signingConfigs.getByName("release")
         }
+    }
+    // F-Droid / IzzyOnDroid reject the encrypted dependency-info blob AGP adds to APKs.
+    dependenciesInfo {
+        includeInApk = false
+        includeInBundle = false
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

@@ -1,6 +1,7 @@
 package com.hyprscreen
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
 import android.graphics.Color
@@ -8,6 +9,7 @@ import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.media.MediaCodec
 import android.media.MediaFormat
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import android.view.Gravity
@@ -63,9 +65,16 @@ import kotlin.concurrent.thread
  * (adb reverse -> 127.0.0.1) or Wi-Fi (UDP discovery), then shows the H.264
  * stream of the Hyprland monitor it creates for us.
  *
- * Handshake:  laptop: HELLO 2 <id> <hostname> <nonce>
- *             phone:  HYPRSCREEN 2 <w> <h> <dpi> <proof>   (proof = "-" over USB, else HMAC)
- *             laptop: OK <secret|-> | DENIED | BUSY
+ * Everything runs over TLS 1.3; the laptop's certificate is pinned.
+ * Handshake:  laptop: HELLO 3 <id> <hostname> <nonce>
+ *             phone:  HYPRSCREEN 3 <w> <h> <dpi> <client nonce> <HMAC proof> [device id]
+ *             laptop: OK | DENIED | BUSY
+ * Wi-Fi pairing (instead of HYPRSCREEN):
+ *             phone:  PAIR 3 <sha256 commit of client nonce> <phone name>
+ *             laptop: PAIRNONCE <server nonce>
+ *             phone:  PAIRREVEAL <client nonce>       both show a code; users compare it
+ *             phone:  PAIRCONFIRM | PAIRCANCEL
+ *             laptop: PAIRED <device id> <secret> | DENIED
  * Then frames: u32 len | u8 flags (1 config, 2 key) | u32 pts ms | Annex-B
  */
 class MainActivity : Activity(), SurfaceHolder.Callback {
@@ -178,7 +187,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             addView(text(13f, MUTED).apply {
                 setPadding(0, dp(20), 0, 0)
                 text = "Plug in over USB and your phone becomes a second monitor automatically.\n" +
-                    "Wi-Fi works after the first USB connection (pairing is automatic)."
+                    "Over Wi-Fi, tap Pair and accept the request on the laptop (Wi-Fi must be on in the laptop's config)."
             })
         }
         setStatus("Looking for your laptop…")
@@ -211,7 +220,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     private fun row(l: Laptop): View {
-        val paired = l.usb || prefs.contains(l.id)
+        val paired = l.usb || pairing(l.id) != null
         return LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -222,17 +231,18 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 orientation = LinearLayout.VERTICAL
                 addView(TextView(context).apply { text = l.name; textSize = 17f; setTextColor(Color.WHITE); typeface = Typeface.DEFAULT_BOLD })
                 addView(TextView(context).apply {
-                    text = if (l.usb) "USB cable" else "Wi-Fi · ${l.host}" + if (paired) "" else " · connect by USB once to pair"
+                    text = if (l.usb) "USB cable" else "Wi-Fi · ${l.host}" + if (paired) "" else " · not paired yet"
                     textSize = 13f; setTextColor(SUBTLE)
                 })
             }, LinearLayout.LayoutParams(0, -2, 1f))
             addView(TextView(context).apply {
-                text = "Connect"; textSize = 15f; typeface = Typeface.DEFAULT_BOLD
-                setTextColor(if (paired) Color.BLACK else MUTED)
-                background = GradientDrawable().apply { cornerRadius = dp(20).toFloat(); setColor(if (paired) ACCENT else CARD2) }
+                text = if (paired) "Connect" else "Pair"; textSize = 15f; typeface = Typeface.DEFAULT_BOLD
+                setTextColor(if (paired) Color.BLACK else ACCENT)
+                background = GradientDrawable().apply {
+                    cornerRadius = dp(20).toFloat(); setColor(if (paired) ACCENT else CARD2)
+                }
                 setPadding(dp(18), dp(8), dp(18), dp(8))
-                isEnabled = paired
-                setOnClickListener { connect(l) }
+                setOnClickListener { if (paired) connect(l) else pairWith(l) }
             })
         }
     }
@@ -241,12 +251,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     // ---------------------------------------------------------------- pairing
 
-    private data class Pairing(val id: String, val name: String, val secret: String, val fingerprint: String)
+    /** device is null for a USB pairing (shared secret), else this phone's own id on the laptop. */
+    private data class Pairing(
+        val id: String, val name: String, val secret: String, val fingerprint: String, val device: String? = null,
+    )
 
     private fun pairing(id: String): Pairing? = prefs.getString("pair_$id", null)?.let { raw ->
         runCatching {
             val o = JSONObject(raw)
-            Pairing(id, o.getString("name"), o.getString("secret"), o.getString("fingerprint"))
+            Pairing(id, o.getString("name"), o.getString("secret"), o.getString("fingerprint"),
+                o.optString("device").takeIf { it.matches(HEX12) })
         }.getOrNull()
     }
 
@@ -264,7 +278,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             runCatching {
                 val o = JSONObject(f.readText())
                 val id = o.getString("id")
-                require(id.matches(Regex("[0-9a-f]{12}")))
+                require(id.matches(HEX12))
                 require(o.getString("secret").matches(Regex("[0-9a-f]{64}")))
                 require(o.getString("fingerprint").matches(Regex("[0-9a-f]{64}")))
                 prefs.edit().putString("pair_$id", o.toString()).apply()
@@ -294,15 +308,19 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
     }
 
-    /** TLS connection that only trusts the given certificate fingerprints (pinning, no CA). */
-    private fun tlsConnect(host: String, pins: Set<String>, timeoutMs: Int): SSLSocket {
+    /**
+     * TLS connection that only trusts the given certificate fingerprints (pinning, no CA).
+     * pins == null accepts any certificate: only for pairing, where the users' code check
+     * covers the fingerprint.
+     */
+    private fun tlsConnect(host: String, pins: Set<String>?, timeoutMs: Int): SSLSocket {
         val trust = object : X509TrustManager {
             override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
             override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) =
                 throw CertificateException("not a server")
             override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String) {
                 val fp = sha256Hex(chain.firstOrNull()?.encoded ?: throw CertificateException("no cert"))
-                if (fp !in pins) throw CertificateException("unknown laptop certificate")
+                if (pins != null && fp !in pins) throw CertificateException("unknown laptop certificate")
             }
         }
         val ctx = SSLContext.getInstance("TLSv1.3").apply { init(null, arrayOf(trust), null) }
@@ -591,9 +609,137 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
     }
 
+    // ---------------------------------------------------------------- Wi-Fi pairing
+
+    private fun pairWith(l: Laptop) {
+        val token = Any()
+        if (!sessionClaim.compareAndSet(null, token)) return
+        thread(name = "pairing", isDaemon = true) {
+            var paired = false
+            try {
+                paired = runPairing(l)
+            } catch (e: Exception) {
+                Log.i(TAG, "pairing ended: $e")
+                setStatus(e.message ?: "Pairing failed")
+            } finally {
+                runCatching { session.getAndSet(null)?.close() }
+                runOnUiThread { pairDialog?.dismiss(); pairDialog = null }
+                sessionClaim.set(null)
+            }
+            if (paired) runOnUiThread { connect(l) }
+        }
+    }
+
+    private var pairDialog: AlertDialog? = null
+
+    /**
+     * Pair over the network. The laptop's certificate isn't known yet, so we accept it, then both
+     * screens show a code derived from its fingerprint and both sides' nonces. We commit to our nonce
+     * before seeing the laptop's, so an attacker in the middle can't make the codes match.
+     */
+    private fun runPairing(l: Laptop): Boolean {
+        setStatus("Asking ${l.name} to pair…")
+        val s = tlsConnect(l.host, null, 3000)
+        session.set(s)
+        val input = BufferedInputStream(s.inputStream)
+        val out = s.outputStream
+        val hello = readLine(input).split(" ")
+        if (hello.size != 5 || hello[0] != "HELLO" || hello[1] != "3") error("Laptop needs updating (protocol mismatch)")
+        if (hello[2] != l.id) error("Unexpected laptop identity")
+        val fingerprint = serverFingerprint(s)
+        val clientNonce = randomHex(16)
+        val name = (Build.MODEL ?: "phone").replace(Regex("[^A-Za-z0-9._-]+"), "-")
+            .trimStart { !it.isLetterOrDigit() }.take(40).ifEmpty { "phone" }
+        out.write("PAIR 3 ${sha256Hex("hs-commit|$clientNonce".toByteArray())} $name\n".toByteArray()); out.flush()
+        val reply = readLine(input).split(" ")
+        when (reply.firstOrNull()) {
+            "PAIRNONCE" -> {}
+            "BUSY" -> error("${l.name} is busy with another request. Try again in a few seconds.")
+            "DENIED" -> error("Wi-Fi pairing is turned off on ${l.name}")
+            else -> error("${l.name} refused the request")
+        }
+        val serverNonce = reply.getOrNull(1)?.takeIf { it.matches(HEX32) } ?: error("Bad reply from laptop")
+        out.write("PAIRREVEAL $clientNonce\n".toByteArray()); out.flush()
+        val code = pairCode(fingerprint, clientNonce, serverNonce)
+
+        // Events: the user's choice from the dialog, or lines from the laptop.
+        val events = LinkedBlockingQueue<String>()
+        s.soTimeout = 0
+        thread(name = "pair-reader", isDaemon = true) {
+            try { while (true) events.put(readLine(input)) } catch (e: Exception) { events.offer("EOF") }
+        }
+        runOnUiThread { showPairDialog(l, code, events) }
+        setStatus("Type the code on ${l.name}, then tap Confirm")
+        val end = System.currentTimeMillis() + PAIR_WAIT_MS
+        var confirmed = false
+        while (true) {
+            val ev = events.poll(maxOf(1, end - System.currentTimeMillis()), TimeUnit.MILLISECONDS)
+                ?: error("Pairing timed out")
+            val parts = ev.split(" ")
+            when (parts[0]) {
+                "CONFIRM" -> {
+                    confirmed = true
+                    out.write("PAIRCONFIRM\n".toByteArray()); out.flush()
+                    setStatus("Waiting for you to accept on ${l.name}…")
+                }
+                "CANCEL" -> {
+                    runCatching { out.write("PAIRCANCEL\n".toByteArray()); out.flush() }
+                    error("Pairing cancelled")
+                }
+                "PAIRED" -> {
+                    if (!confirmed) error("Pairing failed: the laptop answered before you confirmed")
+                    val device = parts.getOrNull(1)?.takeIf { it.matches(HEX12) } ?: error("Bad reply from laptop")
+                    val secret = parts.getOrNull(2)?.takeIf { it.matches(HEX64) } ?: error("Bad reply from laptop")
+                    val record = JSONObject().put("id", l.id).put("name", hello[3].take(64)).put("secret", secret)
+                        .put("fingerprint", fingerprint).put("device", device)
+                    prefs.edit().putString("pair_${l.id}", record.toString()).apply()
+                    setStatus("Paired with ${l.name}")
+                    return true
+                }
+                "DENIED" -> error("${l.name} rejected the request")
+                else -> error("Pairing ended on ${l.name}")
+            }
+        }
+    }
+
+    private fun showPairDialog(l: Laptop, code: String, events: LinkedBlockingQueue<String>) {
+        if (isFinishing || sessionClaim.get() == null) return
+        val body = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(24), dp(8), dp(24), 0)
+            addView(TextView(context).apply {
+                text = "${code.take(3)} ${code.drop(3)}"
+                textSize = 40f; typeface = Typeface.MONOSPACE; setTextColor(ACCENT)
+                gravity = Gravity.CENTER; setPadding(0, dp(8), 0, dp(12))
+            })
+            addView(TextView(context).apply {
+                text = "Type this code in the window that opened on ${l.name} and press Enter, then tap Confirm.\n" +
+                    "If no window opened on your laptop, tap Cancel."
+                textSize = 14f
+            })
+        }
+        pairDialog = AlertDialog.Builder(this)
+            .setTitle("Pair with ${l.name}?")
+            .setView(body)
+            .setCancelable(false)
+            .setPositiveButton("Confirm") { _, _ -> events.offer("CONFIRM") }
+            .setNegativeButton("Cancel") { _, _ -> events.offer("CANCEL") }
+            .show()
+    }
+
+    private fun pairCode(fingerprint: String, clientNonce: String, serverNonce: String): String {
+        val d = MessageDigest.getInstance("SHA-256").digest("hs-code|$fingerprint|$clientNonce|$serverNonce".toByteArray())
+        val n = ((d[0].toLong() and 0xff) shl 24) or ((d[1].toLong() and 0xff) shl 16) or
+            ((d[2].toLong() and 0xff) shl 8) or (d[3].toLong() and 0xff)
+        return "%06d".format(n % 1_000_000)
+    }
+
+    private fun randomHex(bytes: Int): String =
+        ByteArray(bytes).also { SecureRandom().nextBytes(it) }.joinToString("") { "%02x".format(it) }
+
     private fun runSession(l: Laptop) {
         setStatus("Connecting to ${l.name}…")
-        val p = pairing(l.id) ?: error("Connect by USB once to pair with ${l.name}")
+        val p = pairing(l.id) ?: error("Pair with ${l.name} first")
         val s = tlsConnect(l.host, setOf(p.fingerprint), 3000)
         session.set(s)
         if (!alive) error("Closing")
@@ -603,18 +749,23 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val hello = readLine(input).split(" ")
         if (hello.size != 5 || hello[0] != "HELLO" || hello[1] != "3") error("Laptop needs updating (protocol mismatch)")
         if (hello[2] != p.id) error("Unexpected laptop identity")
-        val clientNonce = ByteArray(16).also { SecureRandom().nextBytes(it) }.joinToString("") { "%02x".format(it) }
+        val clientNonce = randomHex(16)
         val proof = hmacHex(p.secret, "c|${hello[4]}|$clientNonce")
         val b = windowManager.maximumWindowMetrics.bounds
         val w = maxOf(b.width(), b.height())
         val h = minOf(b.width(), b.height())
         s.outputStream.apply {
-            write("HYPRSCREEN 3 $w $h ${resources.displayMetrics.densityDpi} $clientNonce $proof\n".toByteArray()); flush()
+            val device = p.device?.let { " $it" } ?: ""
+            write("HYPRSCREEN 3 $w $h ${resources.displayMetrics.densityDpi} $clientNonce $proof$device\n".toByteArray())
+            flush()
         }
         when (readLine(input).split(" ").firstOrNull()) {
             "OK" -> {}
             "BUSY" -> error("${l.name} is already using another display")
-            "DENIED" -> { prefs.edit().remove("pair_${p.id}").apply(); error("Pairing expired — connect by USB once") }
+            "DENIED" -> {
+                prefs.edit().remove("pair_${p.id}").apply()
+                error("${l.name} no longer knows this phone. Pair again, or connect by USB.")
+            }
             else -> error("Laptop refused the connection")
         }
         if (!surfaceReady) error("Screen not ready")
@@ -757,6 +908,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         private const val TAG = "HyprScreen"
         const val PORT = 7878
         const val EXTRA_AUTO_USB = "autoconnect_usb"
+        private val HEX12 = Regex("[0-9a-f]{12}")
+        private val HEX32 = Regex("[0-9a-f]{32}")
+        private val HEX64 = Regex("[0-9a-f]{64}")
+        private const val PAIR_WAIT_MS = 95_000L
         private const val FLAG_CONFIG = 1
         private const val FLAG_KEY = 2
         private const val T_SYNC = 0
