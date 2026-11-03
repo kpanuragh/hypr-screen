@@ -12,12 +12,14 @@ Plug the phone in over USB and it becomes a real Hyprland output next to your la
 ## Features
 
 - **Extended display, not a mirror.** Hyprland gets a real (headless) monitor at the phone's native resolution, with its own workspaces and bar.
-- **Low-latency video.** Frames are captured with `wf-recorder`, hardware-encoded to H.264 (VAAPI) and hardware-decoded on the phone. Only changed frames are sent, so an idle desktop uses almost no bandwidth.
+- **Low-latency video.** Frames are captured with `wf-recorder`, hardware-encoded (VAAPI) and hardware-decoded on the phone. HEVC is used when both sides support it (about half the bandwidth of H.264). Only changed frames are sent, so an idle desktop uses almost no bandwidth.
+- **Portrait or landscape.** Choose an orientation, or let the monitor auto-rotate with the phone. Hyprland gets a real portrait monitor, not a rotated picture.
+- **Display settings on the phone.** Resolution, frame rate (a 50% / 30 fps battery saver), text size and codec.
 - **Plug-and-play USB.** A background service notices the phone, opens the app and connects. Nothing to run by hand.
-- **Wi-Fi (opt-in).** The app discovers your laptop on the local network. Pair once by tapping **Pair** and accepting on the laptop (like Bluetooth), or just plug in USB once.
-- **Secure by default.** Every connection is TLS 1.3 with a pinned certificate, and the phone must prove it holds a pairing key that only ever travels over adb.
+- **Wi-Fi (opt-in).** The app discovers your laptop on the local network. Pair once by tapping **Pair** and accepting on the laptop (like Bluetooth), or just plug in USB once. If Wi-Fi drops, the phone reconnects by itself, and the laptop keeps its monitor (and your windows on it) for 15 seconds.
+- **Secure by default.** Every connection is TLS 1.3 with a pinned certificate, and the phone must prove it holds its pairing key.
 - **Multitouch.** A virtual touchscreen is mapped onto the phone's monitor, so you can tap, drag, scroll and pinch.
-- **Keyboard.** Type with the phone keyboard. An extra key row gives `Esc Tab Ctrl Alt Super ← ↑ ↓ →`, and the modifiers are sticky, so Super then 1 switches workspace. A Bluetooth keyboard paired to the phone is passed straight through.
+- **Keyboard.** Type with the phone keyboard; the picture shrinks to stay visible above it. An extra key row gives `Esc Tab Ctrl Alt Super ← ↑ ↓ →`, and the modifiers are sticky, so Super then 1 switches workspace. A Bluetooth keyboard paired to the phone is passed straight through.
 
 ## Requirements
 
@@ -100,8 +102,9 @@ On the phone, the **⌨** button opens the keyboard (drag it to move it). **Back
 | `auto_usb` | `true` | Connect automatically when a phone is plugged in |
 | `wifi` | `false` | Also listen on the network (Wi-Fi mode) |
 | `wifi_pairing` | `true` | Allow pairing requests over Wi-Fi (they still need your approval) |
+| `codec` | `"auto"` | `auto` (HEVC when the phone supports it), `h264` or `hevc` |
 
-Restart after editing: `systemctl --user restart hypr-screen`. Logs: `journalctl --user -u hypr-screen -f`.
+The phone's own Display settings (resolution, frame rate, text size, codec) override `fps` and `scale` for that phone. Restart after editing: `systemctl --user restart hypr-screen`. Logs: `journalctl --user -u hypr-screen -f`.
 
 ## How it works
 
@@ -138,7 +141,7 @@ This needs JDK 17+ and the Android SDK (platform 36), with the SDK path in `ANDR
 ## Limitations
 
 - Only one phone at a time.
-- While the phone keyboard is open, it covers part of the picture.
+- A floating phone keyboard still floats over the picture (drag it aside, or use a docked keyboard, which the picture shrinks to make room for).
 - Characters outside the US layout are typed through `wtype`, one at a time.
 - No audio. Audio keeps playing on the laptop.
 - Tested on: Omarchy, Hyprland 0.56, Intel Iris Xe, OnePlus (Android 17). Reports from other setups are welcome.

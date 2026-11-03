@@ -1,0 +1,5 @@
+* Portrait and auto-rotate: the laptop's monitor follows the phone's orientation (Display > Orientation)
+* Display settings on the phone: resolution, frame rate (battery saver), text size and video codec
+* HEVC video when the phone and laptop support it: about half the Wi-Fi bandwidth
+* Wi-Fi drop-outs reconnect automatically and windows stay on the phone's monitor
+* The phone keyboard no longer covers the picture: it shrinks to fit above the keyboard

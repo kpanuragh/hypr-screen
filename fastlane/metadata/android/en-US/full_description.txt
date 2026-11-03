@@ -4,7 +4,9 @@ Hypr Screen turns your Android phone into a real extra monitor for the <b>Hyprla
 <ul>
 <li><b>Extended display, not a mirror:</b> Hyprland gets a real monitor at your phone's resolution, with its own workspaces.</li>
 <li><b>Plug and play over USB:</b> plug the phone in and it becomes a monitor. Unplug it and the monitor goes away.</li>
-<li><b>Wi-Fi:</b> pair once by typing a 6-digit code on the laptop, then connect without a cable.</li>
+<li><b>Wi-Fi:</b> pair once by typing a 6-digit code on the laptop, then connect without a cable. Drop-outs reconnect automatically.</li>
+<li><b>Portrait or landscape:</b> pick an orientation or let the monitor auto-rotate with the phone.</li>
+<li><b>Display settings:</b> resolution, frame rate (battery saver), text size and video codec (HEVC or H.264).</li>
 <li><b>Touch:</b> tap, drag and scroll on the phone.</li>
 <li><b>Keyboard:</b> type with the phone keyboard. An extra row gives Esc, Tab, Ctrl, Alt, Super and arrow keys. A Bluetooth keyboard paired to the phone works too.</li>
 <li><b>Low latency:</b> hardware H.264 encoding on the laptop and hardware decoding on the phone.</li>

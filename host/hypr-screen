@@ -42,13 +42,14 @@ import tempfile
 import threading
 import time
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 PORT = 7878
 OUTPUT = "HYPRSCREEN"
 PACKAGE = "com.hyprscreen"
 PAIR_DIR = f"/sdcard/Android/data/{PACKAGE}/files"
 PROTO = "3"
-FLAG_CONFIG, FLAG_KEY = 1, 2
+FLAG_CONFIG, FLAG_KEY, FLAG_INFO = 1, 2, 4  # INFO: "<w> <h> <codec>" before each new stream
+LINGER_SECONDS = 15  # keep a Wi-Fi phone's monitor this long while it reconnects
 START = b"\x00\x00\x00\x01"
 CONF_DIR = os.path.expanduser("~/.config/hypr-screen")
 HANDSHAKE_SECONDS = 6
@@ -68,6 +69,7 @@ DEFAULTS = {
     "auto_usb": True,
     "wifi": False,
     "wifi_pairing": True,
+    "codec": "auto",  # auto (HEVC when the phone supports it), h264 or hevc
 }
 
 
@@ -207,23 +209,22 @@ def set_monitor(mode, position, scale):
         run("hyprctl", "keyword", "monitor", f"{OUTPUT},{mode},{position},{scale}")
 
 
-def add_monitor(w, h, cfg):
+def create_output():
     run("hyprctl", "output", "remove", OUTPUT, check=False)  # stale from a crash
     out = run("hyprctl", "output", "create", "headless", OUTPUT)
     if out.strip() != "ok":
         raise RuntimeError(f"could not create output: {out}")
-    set_monitor(f"{int(w)}x{int(h)}@{int(cfg['fps'])}", cfg["position"], float(cfg["scale"]))
 
 
 def remove_monitor():
     run("hyprctl", "output", "remove", OUTPUT, check=False)
 
 
-def recorder_cmd(cfg, fifo):
-    g = str(int(cfg["fps"]) * 2)
+def recorder_cmd(cfg, fifo, codec="h264", fps=None):
+    g = str(int(fps or cfg["fps"]) * 2)
     cmd = ["wf-recorder", "-y", "-o", OUTPUT, "-m", "flv", "-f", fifo]
     if cfg["encoder"] == "vaapi":
-        cmd += ["-c", "h264_vaapi", "-d", cfg["device"],
+        cmd += ["-c", "hevc_vaapi" if codec == "hevc" else "h264_vaapi", "-d", cfg["device"],
                 "-p", "bf=0", "-p", f"g={g}", "-p", f"qp={int(cfg['qp'])}"]
     else:
         cmd += ["-c", "libx264", "-x", "yuv420p", "-p", "preset=ultrafast",
@@ -267,8 +268,40 @@ def parse_avcc_config(body):
     return bytes(out), nal_len_size
 
 
+def parse_hvcc_config(body):
+    """HEVCDecoderConfigurationRecord -> (Annex-B VPS+SPS+PPS, NAL length size)."""
+    nal_len_size = (body[21] & 3) + 1
+    out, p = bytearray(), 23
+    for _ in range(body[22]):
+        p += 1  # array_completeness | NAL unit type
+        count = int.from_bytes(body[p:p + 2], "big"); p += 2
+        for _ in range(count):
+            n = int.from_bytes(body[p:p + 2], "big"); p += 2
+            out += START + body[p:p + n]; p += n
+    return bytes(out), nal_len_size
+
+
+def flv_video_tag(data):
+    """Classic AVC or enhanced-FLV HEVC video tag -> (kind, frame_type, body), kind = config/frame/None."""
+    if data[0] & 0x80:  # enhanced FLV: frame type, packet type, FourCC
+        packet, frame_type, fourcc = data[0] & 0x0F, (data[0] >> 4) & 0x07, data[1:5]
+        if fourcc != b"hvc1":
+            return None, 0, b""
+        if packet == 0:
+            return "config", frame_type, data[5:]
+        if packet == 1:
+            return "frame", frame_type, data[8:]  # skips the 3-byte composition time
+        if packet == 3:
+            return "frame", frame_type, data[5:]
+        return None, 0, b""
+    if len(data) < 5 or (data[0] & 0x0F) != 7:
+        return None, 0, b""
+    kind = {0: "config", 1: "frame"}.get(data[1])
+    return kind, data[0] >> 4, data[5:]
+
+
 def flv_frames(fifo_path, out_q, stop):
-    """Thread: wf-recorder FLV -> framed H.264 access units on out_q (None = end)."""
+    """Thread: wf-recorder FLV -> framed H.264/HEVC access units on out_q (None = end)."""
     try:
         with open(fifo_path, "rb", buffering=0) as f:
             read_exact(f, 9 + 4)  # FLV header + PreviousTagSize0
@@ -279,15 +312,16 @@ def flv_frames(fifo_path, out_q, stop):
                 ts = int.from_bytes(th[4:7], "big") | (th[7] << 24)
                 data = read_exact(f, size)
                 read_exact(f, 4)
-                if th[0] != 9 or len(data) < 5 or (data[0] & 0x0F) != 7:
-                    continue  # not an AVC video tag
-                body = data[5:]
-                if data[1] == 0:
-                    payload, nal_len_size = parse_avcc_config(body)
+                if th[0] != 9 or len(data) < 5:
+                    continue  # not a video tag
+                kind, frame_type, body = flv_video_tag(data)
+                if kind == "config":
+                    hevc = bool(data[0] & 0x80)
+                    payload, nal_len_size = (parse_hvcc_config if hevc else parse_avcc_config)(body)
                     flags = FLAG_CONFIG
-                elif data[1] == 1:
+                elif kind == "frame":
                     payload = avcc_to_annexb(body, nal_len_size)
-                    flags = FLAG_KEY if (data[0] >> 4) == 1 else 0
+                    flags = FLAG_KEY if frame_type == 1 else 0
                 else:
                     continue
                 frame = struct.pack(">IBI", len(payload), flags, ts & 0xFFFFFFFF) + payload
@@ -320,6 +354,10 @@ KBD_NAME = "hypr-screen-keyboard"
 MAX_SLOTS = 10
 T_SYNC, T_DOWN, T_MOVE, T_UP = 0, 1, 2, 3
 K_TAP, K_CHAR, K_RAW = 10, 11, 14
+# Control messages (phone -> laptop). Laptops before 0.3.0 ignore them.
+C_VIEW, C_PREF, C_HELLO, C_BYE = 20, 21, 22, 23  # VIEW: x=w y=h; PREF: slot=key x=value; HELLO: x=features
+F_INFO, F_HEVC = 1, 2  # phone features: understands INFO frames; can decode HEVC
+P_FPS, P_SCALE, P_CODEC, P_RES = 1, 2, 3, 4  # PREF keys: fps; scale*100 (0 = laptop default); 1 = H.264 only; resolution %
 MSG = struct.Struct(">BBHH")  # type, slot/mods, x, y
 
 # Keys a remote device must never press: they act even behind the lock screen.
@@ -374,6 +412,7 @@ class Touchscreen(UInput):
                 io(UI_ABS_SETUP, struct.pack("<H2xiiiiii", code, 0, 0, mx, 0, 0, res))
 
         super().__init__(TOUCH_NAME, 0x7878, setup)
+        self.size = (w, h)
         self.active = {}  # slot -> tracking id
         self.next_id = 1
         self.primary = None
@@ -513,6 +552,165 @@ def map_touch_to_output():
 
 # --------------------------------------------------------------------- daemon
 
+# --------------------------------------------------------------------- session / pipeline
+
+class Session:
+    """What the phone asked for: size, frame rate, scale, codec. Changes restart the pipeline."""
+
+    def __init__(self, cfg, w, h):
+        self.cfg = cfg
+        self.w, self.h = w, h
+        self.features = 0
+        self.fps = int(cfg["fps"])
+        self.scale_pref = 0  # 0 = laptop default
+        self.res = 100
+        self.h264_only = False
+        self.hevc_failed = False
+        self.dirty_at = None  # monotonic time of the last change not yet applied
+        self.last_restart = 0.0
+        self.sent = False  # any frame reached the phone (set even if the session then fails)
+
+    def read_initial(self, sock, wait=0.3):
+        """Collect the control messages a 0.3.0+ phone sends right after OK. Returns leftover bytes."""
+        end = time.monotonic() + wait
+        buf = b""
+        while time.monotonic() < end:
+            sock.settimeout(max(0.01, end - time.monotonic()))
+            try:
+                chunk = sock.recv(4096)
+            except (TimeoutError, socket.timeout, ssl.SSLWantReadError):
+                break
+            if not chunk:
+                break
+            buf += chunk
+            n = len(buf) // MSG.size * MSG.size
+            got_view = False
+            for off in range(0, n, MSG.size):
+                msg = MSG.unpack_from(buf, off)
+                if msg[0] in (C_VIEW, C_PREF, C_HELLO):
+                    self.control(*msg)
+                    got_view |= msg[0] == C_VIEW
+                else:
+                    n = off  # input already: leave it for the main loop
+                    break
+            buf = buf[n:]
+            if got_view or n == 0 and buf:
+                break
+        self.dirty_at = None
+        return buf
+
+    def control(self, kind, slot, x, y):
+        before = self.key()
+        if kind == C_HELLO:
+            self.features = x
+        elif kind == C_VIEW and 160 <= x <= 4096 and 160 <= y <= 4096:  # 4096: VAAPI encoder limit
+            self.w, self.h = x, y
+        elif kind == C_PREF:
+            if slot == P_FPS and (x == 0 or 10 <= x <= 120):
+                self.fps = x or int(self.cfg["fps"])  # 0 = laptop default
+            elif slot == P_SCALE and (x == 0 or 50 <= x <= 400):
+                self.scale_pref = x
+            elif slot == P_CODEC:
+                self.h264_only = x == 1
+            elif slot == P_RES and 25 <= x <= 100:
+                self.res = x
+        if self.key() != before:
+            self.dirty_at = time.monotonic()
+
+    def restart_due(self):
+        """Apply changes once they settle (a rotation can send several sizes in a row)."""
+        now = time.monotonic()
+        if self.dirty_at is not None and now - self.dirty_at > 0.25 and now - self.last_restart > 1.5:
+            self.dirty_at = None
+            self.last_restart = now  # at most one restart per 1.5 s, whatever the phone sends
+            return True
+        return False
+
+    def key(self):
+        return (self.w, self.h, self.fps, self.scale(), self.codec())
+
+    def scale(self):
+        base = self.scale_pref / 100 if self.scale_pref else float(self.cfg["scale"])
+        return round(min(max(base * self.res / 100, 0.5), 4.0), 2)  # lower resolution, same layout
+
+    def codec(self):
+        want = self.cfg.get("codec", "auto")
+        ok = (self.features & F_HEVC and self.cfg["encoder"] == "vaapi"
+              and not self.h264_only and not self.hevc_failed)
+        return "hevc" if ok and want in ("auto", "hevc") else "h264"
+
+    def describe(self):
+        return f"{self.w}x{self.h}@{self.fps} scale {self.scale()} {self.codec()}"
+
+
+class Pipeline:
+    """Monitor mode + wf-recorder + FLV reader for the session's current settings."""
+
+    def __init__(self, cfg, sess):
+        self.cfg, self.sess = cfg, sess
+        self.rec = self.tmp = self.fifo = None
+        self.stop_event = threading.Event()
+        self.frames = queue.Queue()
+        self.started = 0.0
+
+    def start(self, sock):
+        s = self.sess
+        set_monitor(f"{s.w}x{s.h}@{s.fps}", self.cfg["position"], s.scale())
+        self.tmp = tempfile.mkdtemp(prefix="hypr-screen-")
+        self.fifo = os.path.join(self.tmp, "stream.flv")
+        os.mkfifo(self.fifo, 0o600)
+        self.stop_event = threading.Event()
+        self.frames = queue.Queue(maxsize=8)
+        self.codec = s.codec()
+        if s.features & F_INFO:  # tell the phone what is coming before the first config frame
+            info = f"{s.w} {s.h} {self.codec}".encode()
+            sock.settimeout(10)
+            sock.sendall(struct.pack(">IBI", len(info), FLAG_INFO, 0) + info)
+        with open(os.path.join(self.tmp, "wf-recorder.log"), "w") as errlog:
+            self.rec = subprocess.Popen(recorder_cmd(self.cfg, self.fifo, self.codec, s.fps),
+                                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=errlog)
+        self.started = time.monotonic()
+        threading.Thread(target=flv_frames, args=(self.fifo, self.frames, self.stop_event), daemon=True).start()
+
+    def alive(self):
+        return self.rec is not None and self.rec.poll() is None
+
+    def fallback(self):
+        """HEVC encoder died right away: remember that and say whether to retry with H.264."""
+        if self.codec == "hevc" and time.monotonic() - self.started < 5:
+            log("HEVC encoding failed: " + self.error_tail() + "; falling back to H.264")
+            self.stop()
+            self.sess.hevc_failed = True
+            return True
+        if self.rec is not None and self.rec.poll() is not None:
+            log("wf-recorder exited: " + self.error_tail())
+        return False
+
+    def error_tail(self):
+        try:
+            with open(os.path.join(self.tmp, "wf-recorder.log")) as f:
+                return " | ".join(f.read().strip().splitlines()[-3:])
+        except (OSError, TypeError):
+            return "?"
+
+    def stop(self):
+        self.stop_event.set()
+        if self.rec and self.rec.poll() is None:
+            self.rec.terminate()
+            try:
+                self.rec.wait(2)
+            except subprocess.TimeoutExpired:
+                self.rec.kill()
+        if self.fifo:
+            try:  # unblock the reader if it is still waiting to open the fifo
+                os.close(os.open(self.fifo, os.O_WRONLY | os.O_NONBLOCK))
+            except OSError:
+                pass
+        if self.tmp:
+            shutil.rmtree(self.tmp, ignore_errors=True)
+        self.rec = self.tmp = self.fifo = None
+
+
 # --------------------------------------------------------------------- pairing prompt
 
 TERMINALS = (  # (binary, args before the command)
@@ -613,6 +811,8 @@ class Daemon:
         self.busy = threading.Lock()
         self.pending = threading.BoundedSemaphore(MAX_PENDING)
         self.pair_lock = threading.Lock()  # one pairing request at a time
+        self.linger_lock = threading.Lock()
+        self.linger_token = None  # set while a disconnected Wi-Fi phone's monitor is kept
         self.pair_quiet_until = 0.0
         self.hostname = socket.gethostname().replace(" ", "-")[:64] or "laptop"
 
@@ -817,66 +1017,86 @@ class Daemon:
             if hasattr(socket, opt):
                 sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), val)
 
-        tmp = tempfile.mkdtemp(prefix="hypr-screen-")
-        fifo = os.path.join(tmp, "stream.flv")
-        errlog_path = os.path.join(tmp, "wf-recorder.log")
-        os.mkfifo(fifo, 0o600)
-        rec = touch = keyboard = None
-        stop = threading.Event()
-        frames = queue.Queue(maxsize=8)
+        sess = Session(self.cfg, w, h)
+        pipe = keyboard = None
+        self.touch = None
+        bye = False
+        have_monitor = False
         try:
-            add_monitor(w, h, self.cfg)
-            log(f"display session via {via}: {w}x{h} scale {self.cfg['scale']}")
-            notify("Phone connected as a display", f"{w}×{h} via {via}")
+            buf = sess.read_initial(sock)  # 0.3.0+ phones announce features/size/prefs first
+            if self.reclaim_monitor():
+                log("phone is back: reusing its monitor")
+            else:
+                create_output()
+            have_monitor = True
+            log(f"display session via {via}: {sess.describe()}")
+            notify("Phone connected as a display", f"{sess.w}×{sess.h} via {via}")
             try:
                 map_touch_to_output()
-                touch = Touchscreen(w, h, dpi)
+                self.touch = Touchscreen(sess.w, sess.h, dpi)
                 keyboard = Keyboard()
             except OSError as e:
                 log(f"touch/keyboard input unavailable: {e}")
-            with open(errlog_path, "w") as errlog:
-                rec = subprocess.Popen(recorder_cmd(self.cfg, fifo), stdin=subprocess.DEVNULL,
-                                       stdout=subprocess.DEVNULL, stderr=errlog)
-            threading.Thread(target=flv_frames, args=(fifo, frames, stop), daemon=True).start()
-            self.loop(sock, frames, touch, keyboard, rec)
-            if rec.poll() is not None:
-                with open(errlog_path) as f:
-                    tail = f.read().strip().splitlines()[-4:]
-                log("wf-recorder exited: " + " | ".join(tail))
+            pipe = Pipeline(self.cfg, sess)
+            pipe.start(sock)
+            self.dpi = dpi
+            bye = self.loop(sock, sess, pipe, keyboard, buf)
         finally:
-            stop.set()
-            if rec and rec.poll() is None:
-                rec.terminate()
-                try:
-                    rec.wait(2)
-                except subprocess.TimeoutExpired:
-                    rec.kill()
-            try:  # unblock the reader if it is still waiting to open the fifo
-                os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
-            except OSError:
-                pass
-            if touch:
-                quietly(touch.close)
+            if pipe:
+                pipe.stop()
+            if self.touch:
+                quietly(self.touch.close)
+                self.touch = None
             if keyboard:
                 quietly(keyboard.close)
-            quietly(remove_monitor)
-            shutil.rmtree(tmp, ignore_errors=True)
-            log("display session ended")
+            # Linger only for a working Wi-Fi session that dropped (not Back, not our own failure).
+            linger = have_monitor and sess.sent and via != "USB" and not bye
+            if linger:
+                self.linger_monitor()  # give the phone a moment to come back
+            elif have_monitor:
+                quietly(remove_monitor)
+            log("display session ended" + (f" (monitor kept {LINGER_SECONDS}s)" if linger else ""))
             notify("Phone display disconnected")
 
-    def loop(self, sock, frames, touch, keyboard, rec):
-        """Single-threaded pump: send frames, apply input, until either side stops."""
-        buf = b""
+    # ---- keep the monitor while a Wi-Fi phone reconnects
+    def linger_monitor(self):
+        with self.linger_lock:
+            token = object()
+            self.linger_token = token
+        def expire():
+            with self.linger_lock:
+                if self.linger_token is not token:
+                    return  # reclaimed by a new session
+                self.linger_token = None
+                quietly(remove_monitor)
+        t = threading.Timer(LINGER_SECONDS, expire)
+        t.daemon = True
+        t.start()
+
+    def reclaim_monitor(self):
+        """True if a lingering monitor was taken over (windows stay where they were)."""
+        with self.linger_lock:
+            if self.linger_token is None:
+                return False
+            self.linger_token = None
+            return OUTPUT in run("hyprctl", "monitors", check=False)
+
+    def loop(self, sock, sess, pipe, keyboard, buf=b""):
+        """Single-threaded pump: send frames, apply input. Returns True if the phone said goodbye."""
         while True:
             try:
-                frame = frames.get(timeout=0.004)
+                frame = pipe.frames.get(timeout=0.004)
             except queue.Empty:
                 frame = b""
-            if frame is None or rec.poll() is not None:
-                return
+            if frame is None or not pipe.alive():
+                if pipe.fallback():  # HEVC failed to start: retry with H.264
+                    pipe.start(sock)
+                    continue
+                return False
             if frame:
                 sock.settimeout(10)
                 sock.sendall(frame)
+                sess.sent = True
             sock.settimeout(0)
             while True:  # drain everything the phone has sent
                 try:
@@ -884,19 +1104,35 @@ class Daemon:
                 except (ssl.SSLWantReadError, BlockingIOError, socket.timeout):
                     break
                 if not chunk:
-                    return  # phone disconnected
+                    return False  # phone disconnected
                 buf += chunk
                 if len(buf) > 1 << 20:
                     raise RuntimeError("input flood")
             n = len(buf) // MSG.size * MSG.size
             for off in range(0, n, MSG.size):
                 msg = MSG.unpack_from(buf, off)
-                if msg[0] >= K_TAP:
+                kind = msg[0]
+                if kind == C_BYE:
+                    return True
+                if kind >= C_VIEW:
+                    sess.control(*msg)
+                elif kind >= K_TAP:
                     if keyboard:
                         keyboard.handle(*msg)
-                elif touch:
-                    touch.handle(*msg)
+                elif self.touch:
+                    self.touch.handle(*msg)
             buf = buf[n:]
+            if sess.restart_due():
+                log(f"reconfiguring: {sess.describe()}")
+                pipe.stop()
+                if self.touch and (self.touch.size != (sess.w, sess.h)):
+                    quietly(self.touch.close)  # new size: rebuild so gesture speed stays right
+                    try:
+                        self.touch = Touchscreen(sess.w, sess.h, self.dpi)
+                    except OSError as e:
+                        self.touch = None
+                        log(f"touch input unavailable: {e}")
+                pipe.start(sock)
 
     # ---- UDP discovery for Wi-Fi
     def discovery(self):
