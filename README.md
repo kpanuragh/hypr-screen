@@ -13,7 +13,7 @@ Plug the phone in over USB and it becomes a real Hyprland output next to your la
 
 - **Extended display, or a mirror.** Hyprland gets a real (headless) monitor at the phone's native resolution, with its own workspaces and bar. Or set **Mode → Mirror** on the phone to show a copy of your laptop screen, for example to show someone what you are doing.
 - **Your workspaces, per phone.** Pick workspaces that always open on the phone (say, chat and music on 8 and 9), and a position for each phone.
-- **Low-latency video.** Frames are captured with `wf-recorder`, hardware-encoded (VAAPI) and hardware-decoded on the phone. HEVC is used when both sides support it (about half the bandwidth of H.264). Only changed frames are sent, so an idle desktop uses almost no bandwidth.
+- **Low-latency video.** Frames are captured with `wf-recorder`, hardware-encoded (VAAPI on Intel/AMD, NVENC on NVIDIA) and hardware-decoded on the phone. HEVC is used when both sides support it (about half the bandwidth of H.264). Only changed frames are sent, so an idle desktop uses almost no bandwidth.
 - **Portrait or landscape.** Choose an orientation, or let the monitor auto-rotate with the phone. Hyprland gets a real portrait monitor, not a rotated picture.
 - **Display settings on the phone.** Resolution, frame rate (a 50% / 30 fps battery saver), text size and codec.
 - **Plug-and-play USB.** A background service notices the phone, opens the app and connects. Nothing to run by hand.
@@ -34,7 +34,7 @@ Plug the phone in over USB and it becomes a real Hyprland output next to your la
 **Laptop**
 - Hyprland **0.56+**. Both the Lua config (`hyprctl eval`) and the legacy `hyprctl keyword` are supported.
 - `wf-recorder`, `android-tools` (adb), `openssl`, Python 3 (standard library only)
-- A VAAPI-capable GPU for hardware encoding. Intel is tested; others should work. Set `"encoder": "x264"` for software encoding.
+- A GPU for hardware encoding: VAAPI (Intel, AMD) or NVENC (NVIDIA, proprietary driver). Intel is tested. The encoder is picked automatically: the configured one (`"encoder"`) is tried first, and if it fails to start, the others follow (VAAPI → NVENC → software x264).
 - Write access to `/dev/uinput` for touch and keyboard. Desktop sessions usually get this through logind. Check with `getfacl /dev/uinput`.
 - Optional: `wtype`, for typing characters outside the US layout.
 
@@ -139,7 +139,7 @@ The widget shows a phone icon while a phone is connected (class `connected` or `
 | `position` | `"auto-right"` | Monitor position (`auto-left`, `0x1080`, …) |
 | `fps` | `60` | Refresh rate of the virtual monitor |
 | `qp` | `24` | Quality: lower is sharper and uses more bandwidth |
-| `encoder` | `"vaapi"` | `vaapi` or `x264` |
+| `encoder` | `"vaapi"` | Encoder to try first: `vaapi`, `nvenc` (NVIDIA) or `x264` (software). Others are tried if it fails |
 | `device` | `"/dev/dri/renderD128"` | VAAPI render node |
 | `auto_usb` | `true` | Connect automatically when a phone is plugged in |
 | `wifi` | `false` | Also listen on the network (Wi-Fi mode) |
@@ -163,7 +163,7 @@ The phone's own Display settings (resolution, frame rate, text size, codec) over
 ## How it works
 
 ```
-Hyprland ── headless output "HYPRSCREEN" ── wf-recorder (H.264/VAAPI, FLV)
+Hyprland ── headless output "HYPRSCREEN" ── wf-recorder (H.264/HEVC via VAAPI or NVENC, FLV)
                                                    │
                                 hypr-screen service (Python)
                       FLV → framed H.264 ──────────┼──────────► phone: MediaCodec → SurfaceView

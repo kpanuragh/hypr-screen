@@ -1,0 +1,1 @@
+* Laptops with an NVIDIA GPU now work: the laptop service uses NVIDIA's NVENC encoder and picks a working encoder automatically (VAAPI, NVENC or software). The app itself is unchanged

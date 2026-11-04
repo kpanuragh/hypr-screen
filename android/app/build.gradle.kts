@@ -17,8 +17,8 @@ android {
         applicationId = "com.hyprscreen"
         minSdk = 30
         targetSdk = 36
-        versionCode = 5
-        versionName = "0.5.0"
+        versionCode = 6
+        versionName = "0.5.1"
     }
     signingConfigs {
         if (keystoreProps != null) create("release") {

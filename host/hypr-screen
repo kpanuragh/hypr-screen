@@ -42,7 +42,7 @@ import tempfile
 import threading
 import time
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 PORT = 7878
 OUTPUT = "HYPRSCREEN"
 PACKAGE = "com.hyprscreen"
@@ -67,7 +67,7 @@ DEFAULTS = {
     "position": "auto-right",
     "fps": 60,
     "qp": 24,
-    "encoder": "vaapi",
+    "encoder": "vaapi",  # tried first; others follow if it fails: vaapi, nvenc (NVIDIA), x264 (software)
     "device": "/dev/dri/renderD128",
     "auto_usb": True,
     "wifi": False,
@@ -227,13 +227,37 @@ def remove_monitor():
     run("hyprctl", "output", "remove", OUTPUT, check=False)
 
 
-def recorder_cmd(cfg, fifo, codec="h264", fps=None, qp=None, output=OUTPUT):
+ENCODERS = ("vaapi", "nvenc", "x264")
+HEVC_ENCODERS = ("vaapi", "nvenc")
+BROKEN = set()  # (encoder, codec) pairs known not to work on this machine (learned, see Pipeline.fallback)
+
+
+def encoder_order(cfg):
+    """The configured encoder first, then the others that could work here."""
+    first = cfg.get("encoder", "vaapi")
+    order = [first] if first in ENCODERS else []
+    for enc in ENCODERS:
+        if enc in order:
+            continue
+        if enc == "vaapi" and not os.path.exists(cfg["device"]):
+            continue
+        if enc == "nvenc" and not os.path.exists("/dev/nvidiactl"):
+            continue
+        order.append(enc)
+    return order
+
+
+def recorder_cmd(cfg, fifo, codec="h264", fps=None, qp=None, output=OUTPUT, encoder="vaapi"):
     g = str(int(fps or cfg["fps"]) * 2)
     qp = int(qp if qp is not None else cfg["qp"])
     cmd = ["wf-recorder", "-y", "-o", output, "-m", "flv", "-f", fifo]
-    if cfg["encoder"] == "vaapi":
+    if encoder == "vaapi":
         cmd += ["-c", "hevc_vaapi" if codec == "hevc" else "h264_vaapi", "-d", cfg["device"],
                 "-p", "bf=0", "-p", f"g={g}", "-p", f"qp={qp}"]
+    elif encoder == "nvenc":  # NVIDIA: takes the captured frames directly, no VAAPI needed
+        cmd += ["-c", "hevc_nvenc" if codec == "hevc" else "h264_nvenc", "-x", "yuv420p",
+                "-p", "preset=p1", "-p", "tune=ull", "-p", "zerolatency=1", "-p", "bf=0",
+                "-p", f"g={g}", "-p", "rc=constqp", "-p", f"qp={qp}"]
     else:
         cmd += ["-c", "libx264", "-x", "yuv420p", "-p", "preset=ultrafast",
                 "-p", "tune=zerolatency", "-p", f"crf={qp}", "-p", "bf=0", "-p", f"g={g}"]
@@ -807,8 +831,9 @@ class Session:
         self.mirror = False
         self.target = OUTPUT  # output being captured (another monitor in mirror mode)
         self.position = cfg["position"]
-        self.hevc_failed = False
         self.initial = True  # still reading what the phone sent right after OK
+        self.failed = set()  # (encoder, codec) pairs that failed in this session
+        self.learn = set()  # of those, failures worth remembering for later sessions
         self.kicked = False  # ended from the laptop (--disconnect / --forget)
         self.dirty_at = None  # monotonic time of the last change not yet applied
         self.last_restart = 0.0
@@ -929,17 +954,29 @@ class Session:
         base = self.scale_pref / 100 if self.scale_pref else float(self.cfg["scale"])
         return round(min(max(base * self.res / 100, 0.5), 4.0), 2)  # lower resolution, same layout
 
+    def choose(self):
+        """(encoder, codec): the first pair that hasn't failed on this machine."""
+        hevc = (self.features & F_HEVC and not self.h264_only
+                and self.cfg.get("codec", "auto") in ("auto", "hevc"))
+        order = encoder_order(self.cfg)
+        for enc in order:
+            for codec in (["hevc"] if hevc and enc in HEVC_ENCODERS else []) + ["h264"]:
+                if (enc, codec) not in BROKEN and (enc, codec) not in self.failed:
+                    return enc, codec
+        return order[-1], "h264"
+
     def codec(self):
-        want = self.cfg.get("codec", "auto")
-        ok = (self.features & F_HEVC and self.cfg["encoder"] == "vaapi"
-              and not self.h264_only and not self.hevc_failed)
-        return "hevc" if ok and want in ("auto", "hevc") else "h264"
+        return self.choose()[1]
+
+    def encoder(self):
+        return self.choose()[0]
 
     def describe(self):
         extra = f" (link busy: quality level {self.level})" if self.level else ""
         if self.mirror:
             extra = f" mirroring {self.target}" + extra
-        return f"{self.w}x{self.h}@{self.eff_fps()} scale {self.scale()} {self.codec()}{extra}"
+        enc, codec = self.choose()
+        return f"{self.w}x{self.h}@{self.eff_fps()} scale {self.scale()} {codec} via {enc}{extra}"
 
 
 class Pipeline:
@@ -961,13 +998,14 @@ class Pipeline:
         os.mkfifo(self.fifo, 0o600)
         self.stop_event = threading.Event()
         self.frames = queue.Queue(maxsize=8)
-        self.codec = s.codec()
+        self.encoder, self.codec = s.choose()
         if s.features & F_INFO:  # tell the phone what is coming before the first config frame
             info = f"{s.w} {s.h} {self.codec} {H_PEN | H_TRACKPAD}".encode()
             sock.settimeout(10)
             sock.sendall(struct.pack(">IBI", len(info), FLAG_INFO, 0) + info)
         with open(os.path.join(self.tmp, "wf-recorder.log"), "w") as errlog:
-            self.rec = subprocess.Popen(recorder_cmd(self.cfg, self.fifo, self.codec, s.eff_fps(), s.qp(), s.target),
+            self.rec = subprocess.Popen(recorder_cmd(self.cfg, self.fifo, self.codec, s.eff_fps(), s.qp(), s.target,
+                                                     self.encoder),
                                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=errlog)
         self.started = time.monotonic()
         s.reset_window(delay=1.0)  # the new stream starts with a keyframe burst: don't count it
@@ -977,11 +1015,20 @@ class Pipeline:
         return self.rec is not None and self.rec.poll() is None
 
     def fallback(self):
-        """HEVC encoder died right away: remember that and say whether to retry with H.264."""
-        if self.codec == "hevc" and time.monotonic() - self.started < 5:
-            log("HEVC encoding failed: " + self.error_tail() + "; falling back to H.264")
+        """The encoder died right away: remember that and say whether to retry with the next one
+        (HEVC -> H.264, then VAAPI -> NVENC -> x264)."""
+        s = self.sess
+        if time.monotonic() - self.started < 5:
+            failed = (self.encoder, self.codec)
+            s.failed.add(failed)
+            if not s.sent and not s.mirror:  # a restart or a mirrored monitor may fail for other reasons
+                s.learn.add(failed)
+            nxt = s.choose()
+            if nxt in s.failed:  # everything failed: probably not the encoders' fault
+                log(f"wf-recorder exited: {self.error_tail()}")
+                return False
+            log(f"{failed[1]} via {failed[0]} failed: {self.error_tail()}; trying {nxt[1]} via {nxt[0]}")
             self.stop()
-            self.sess.hevc_failed = True
             return True
         if self.rec is not None and self.rec.poll() is not None:
             log("wf-recorder exited: " + self.error_tail())
@@ -1529,6 +1576,9 @@ class Daemon:
                 sock.sendall(frame)
                 sess.count_busy(t0, time.monotonic())
                 sess.sent = True
+                if sess.learn:  # another encoder works, so the ones that failed really don't: skip them next time
+                    BROKEN.update(sess.learn)
+                    sess.learn.clear()
             sock.settimeout(0)
             while True:  # drain everything the phone has sent
                 try:
