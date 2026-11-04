@@ -1,0 +1,3 @@
+* Shared clipboard: text copied on the laptop can be pasted on the phone, and text copied on the phone reaches the laptop when you switch back (or tap 📋 on the key row). Sensitive clips (passwords) are skipped. Settings → Shared clipboard
+* Touch as mouse: Settings → Touch input → Mouse makes taps click and drags select text, for apps like terminals that ignore touch
+* Needs Hypr Screen 0.6.0 on the laptop (and wl-clipboard for the clipboard)

@@ -27,7 +27,9 @@ Plug the phone in over USB and it becomes a real Hyprland output next to your la
   - Tap to click; hold, then move to drag.
   - Two-finger tap for right-click; two-finger drag to scroll.
   - Three-finger tap for middle-click; three-finger swipe to switch workspace.
-- **Keyboard.** Type with the phone keyboard; the picture shrinks to stay visible above it. An extra key row gives `Esc Tab Ctrl Alt Super ← ↑ ↓ →`, and the modifiers are sticky, so Super then 1 switches workspace. A Bluetooth keyboard paired to the phone is passed straight through.
+- **Touch as mouse.** For apps that ignore touch (kitty and other terminals), set **Touch input → Mouse** on the phone: tap to click, drag to select text, long-press or two-finger tap to right-click, two fingers to scroll.
+- **Shared clipboard.** Text copied on the laptop can be pasted on the phone, and text copied on the phone reaches the laptop when you switch back to Hypr Screen (or tap 📋 on the key row). Passwords marked sensitive by a password manager are never shared. Turn it off with **Shared clipboard → Off** on the phone. Needs `wl-clipboard` on the laptop.
+- **Keyboard.** Type with the phone keyboard; the picture shrinks to stay visible above it. An extra key row gives `Esc Tab Ctrl Alt Super ← ↑ ↓ → 📋`, and the modifiers are sticky, so Super then 1 switches workspace. A Bluetooth keyboard paired to the phone is passed straight through.
 
 ## Requirements
 
@@ -36,7 +38,7 @@ Plug the phone in over USB and it becomes a real Hyprland output next to your la
 - `wf-recorder`, `android-tools` (adb), `openssl`, Python 3 (standard library only)
 - A GPU for hardware encoding: VAAPI (Intel, AMD) or NVENC (NVIDIA, proprietary driver). Intel is tested. The encoder is picked automatically: the configured one (`"encoder"`) is tried first, and if it fails to start, the others follow (VAAPI → NVENC → software x264).
 - Write access to `/dev/uinput` for touch and keyboard. Desktop sessions usually get this through logind. Check with `getfacl /dev/uinput`.
-- Optional: `wtype`, for typing characters outside the US layout.
+- Optional: `wl-clipboard`, for the shared clipboard; `wtype`, for typing characters outside the US layout.
 
 **Phone**
 - Android 11+ with **USB debugging** enabled (Developer options).
@@ -148,6 +150,7 @@ The widget shows a phone icon while a phone is connected (class `connected` or `
 | `adaptive` | `true` | On Wi-Fi, lower quality/frame rate while the link can't keep up |
 | `workspaces` | `[]` | Workspaces to put on the phone while it is connected, e.g. `[8, 9]` or `["name:chat"]` |
 | `mirror_output` | `""` | Monitor shown in mirror mode (`""` = the focused one), e.g. `"eDP-1"` |
+| `clipboard` | `true` | Share clipboard text with phones that turn it on (needs `wl-clipboard`) |
 | `phones` | `{}` | Per-phone `position` and `workspaces`, keyed by the id from `--devices` (or `"usb"`) |
 
 Example for a phone that sits below the laptop screen and gets workspace 9:

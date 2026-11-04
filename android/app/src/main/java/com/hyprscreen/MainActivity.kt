@@ -2,6 +2,9 @@ package com.hyprscreen
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.ClipData
+import android.content.ClipDescription
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
@@ -36,6 +39,7 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import java.io.BufferedInputStream
 import java.io.DataInputStream
 import java.io.EOFException
@@ -111,6 +115,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     @Volatile private var trackpad = false
     /** What the laptop supports (from INFO; 0 for laptops before 0.4.0, which get plain touch). */
     @Volatile private var hostFeatures = 0
+    private val clipboard by lazy { getSystemService(ClipboardManager::class.java) }
+    /** Last clipboard text shared either way (UI thread): never send back what the laptop just sent. */
+    private var lastClip: String? = null
+    private val clipListener = ClipboardManager.OnPrimaryClipChangedListener { checkClip() }
     /** Pointer ids we sent T_DOWN for and haven't released (UI thread only). */
     private val activeTouches = mutableSetOf<Int>()
     private var penHovered = false
@@ -201,6 +209,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) checkClip() // Android only lets the focused app read the clipboard: e.g. back from copying elsewhere
         if (hasFocus) window.insetsController?.let {
             it.hide(WindowInsets.Type.systemBars())
             it.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
@@ -210,10 +219,64 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     override fun onStart() {
         super.onStart()
         visible = true
+        clipboard.addPrimaryClipChangedListener(clipListener)
         // Opening the app reconnects to the last laptop (not while a session is already running).
         if (settings.getInt("auto", 1) == 1 && sessionClaim.get() == null) autoLast = true
     }
-    override fun onStop() { visible = false; autoLast = false; super.onStop() }
+    override fun onStop() {
+        visible = false; autoLast = false
+        clipboard.removePrimaryClipChangedListener(clipListener)
+        super.onStop()
+    }
+
+    // ---------------------------------------------------------------- clipboard
+
+    /** Clipboard text, or null if empty, not text, or marked sensitive (passwords). */
+    private fun readClip(): String? {
+        val clip = try { clipboard.primaryClip } catch (e: SecurityException) { null } ?: return null
+        if (Build.VERSION.SDK_INT >= 33 &&
+            clip.description.extras?.getBoolean(ClipDescription.EXTRA_IS_SENSITIVE) == true) return null
+        if (clip.itemCount == 0) return null
+        return clip.getItemAt(0).text?.toString()?.takeIf { it.isNotEmpty() } // text only: never URIs or intents
+    }
+
+    /** Send the clipboard to the laptop if it changed since we last shared it. */
+    private fun checkClip() {
+        // Only read while sharing: reading makes Android 12+ show a "pasted from clipboard" notice.
+        if (settings.getInt("clip", 1) != 1 || !streaming || hostFeatures and H_CLIP == 0) return
+        val text = readClip() ?: return
+        if (text != lastClip && sendClip(text)) lastClip = text
+    }
+
+    /** Key bar button: send the clipboard now, changed or not. */
+    private fun sendClipNow() {
+        val why = when {
+            settings.getInt("clip", 1) != 1 -> "Shared clipboard is off in settings"
+            !streaming -> "Not connected"
+            hostFeatures and H_CLIP == 0 -> "This laptop doesn't share the clipboard (needs Hypr Screen 0.6.0 and wl-clipboard)"
+            else -> null
+        }
+        val text = if (why == null) readClip() else null
+        val sent = text != null && sendClip(text)
+        if (sent) lastClip = text
+        val msg = why ?: if (text == null) "Clipboard is empty or not text" else if (sent) "Clipboard sent" else "Clipboard too large (256 KB max)"
+        Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+    }
+
+    private fun sendClip(text: String): Boolean {
+        if (!streaming || hostFeatures and H_CLIP == 0) return false
+        val bytes = text.toByteArray(Charsets.UTF_8)
+        if (bytes.size > CLIP_MAX) return false
+        touchQueue.offer(msg(C_CLIP, 0, bytes.size ushr 16, bytes.size and 0xffff) + bytes)
+        return true
+    }
+
+    /** Text the laptop copied: put it on the phone's clipboard. */
+    private fun receiveClip(text: String) = runOnUiThread {
+        if (settings.getInt("clip", 1) != 1) return@runOnUiThread
+        lastClip = text
+        clipboard.setPrimaryClip(ClipData.newPlainText("Hypr Screen", text))
+    }
 
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
@@ -326,6 +389,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 listOf(if (hevcDecoder) "Auto (HEVC)" else "Auto (H.264)", "H.264 only"), 0),
             Opt("Mode", "mode", listOf(0, 1), listOf("Extra monitor", "Mirror laptop screen"), 0),
             Opt("Auto-connect", "auto", listOf(1, 0), listOf("Last laptop, when found", "Off"), 1),
+            Opt("Shared clipboard", "clip", listOf(1, 0), listOf("On", "Off"), 1),
+            Opt("Touch input", "touch", listOf(0, 1), listOf("Touchscreen", "Mouse (tap clicks, drag selects)"), 0),
         )
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -749,6 +814,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private fun setTrackpad(on: Boolean) = runOnUiThread {
         if (trackpad && !on) padRelease()
         if (on) releaseTouches() // a finger resting on the screen must not stay pressed on the laptop
+        ptrCancel(); padActive = false // a gesture started in the other mode ends here
         trackpad = on
         (padButton.background as GradientDrawable).setColor(if (on) ACCENT else Color.parseColor("#99000000"))
         padButton.setTextColor(if (on) Color.BLACK else Color.WHITE)
@@ -776,6 +842,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         key("↑") { sendKey(103) }
         key("↓") { sendKey(108) }
         key("→") { sendKey(106) }
+        key("📋") { sendClipNow() }.contentDescription = "Send clipboard to laptop"
         return bar
     }
 
@@ -858,6 +925,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private var padSwipeDone = false
     private var padAccX = 0f
     private var padAccY = 0f
+    private var padActive = false // saw this gesture's DOWN in trackpad mode
     private val padLongPress = Runnable {
         if (trackpad && padCount == 1 && padMoved < ViewConfiguration.get(this).scaledTouchSlop) {
             padDragging = true // hold, then move: drag with the left button held
@@ -878,9 +946,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         if (n > 0) { cx /= n; cy /= n }
         val density = resources.displayMetrics.density
         val slop = ViewConfiguration.get(this).scaledTouchSlop
+        if (e.actionMasked != MotionEvent.ACTION_DOWN && !padActive) return
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 padRelease()
+                padActive = true
                 padDownAt = SystemClock.uptimeMillis(); padMoved = 0f; padMaxCount = 1; padCount = 1
                 padLastX = cx; padLastY = cy; padAccX = 0f; padAccY = 0f
                 surfaceView.postDelayed(padLongPress, 450)
@@ -927,7 +997,110 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                     val button = when (padMaxCount) { 1 -> 0; 2 -> 1; else -> 2 } // tap / 2-finger / 3-finger
                     touchQueue.offer(msg(M_BTN, button, 1, 0) + msg(M_BTN, button, 0, 0))
                 }
-                padCount = 0; padSwipeDone = false
+                padCount = 0; padSwipeDone = false; padActive = false
+            }
+        }
+    }
+
+    // ---- touch as mouse: for apps that ignore touch (terminals). Tap = click, drag = select,
+    // long press = right click, two fingers = scroll.
+    private var ptrX = 0
+    private var ptrY = 0
+    private var ptrDownX = 0f
+    private var ptrDownY = 0f
+    private var ptrDownAt = 0L
+    private var ptrDragging = false
+    private var ptrDone = false // long press or second finger: nothing more for this touch
+    private var ptrMaxCount = 0
+    private var ptrScrolled = false
+    private var ptrMoved = 0f // two-finger movement: a tap below slop, a scroll above
+    private var ptrActive = false // saw this gesture's DOWN in mouse mode
+    private val ptrLongPress = Runnable {
+        if (ptrActive && !ptrDragging && !ptrDone && ptrMaxCount == 1) {
+            ptrDone = true
+            touchQueue.offer(msg(A_POS, A_RIGHT, ptrX, ptrY) + msg(A_POS, 0, ptrX, ptrY))
+        }
+    }
+
+    /** End a mouse-mode gesture early (pen arrived, mode switched): release the button, no click. */
+    private fun ptrCancel() {
+        surfaceView.removeCallbacks(ptrLongPress)
+        if (ptrDragging) touchQueue.offer(msg(A_POS, 0, ptrX, ptrY))
+        ptrDragging = false; ptrDone = true; ptrActive = false
+    }
+
+    private fun onMouseTouch(v: View, e: MotionEvent) {
+        val slop = ViewConfiguration.get(this).scaledTouchSlop
+        if (e.actionMasked != MotionEvent.ACTION_DOWN && !ptrActive) return
+        fun at(i: Int) {
+            ptrX = (e.getX(i) / v.width * 65535f).toInt().coerceIn(0, 65535)
+            ptrY = (e.getY(i) / v.height * 65535f).toInt().coerceIn(0, 65535)
+        }
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                at(0)
+                ptrDownX = e.x; ptrDownY = e.y; ptrDownAt = SystemClock.uptimeMillis()
+                ptrDragging = false; ptrDone = false; ptrMaxCount = 1; ptrScrolled = false; ptrMoved = 0f
+                ptrActive = true
+                touchQueue.offer(msg(A_POS, 0, ptrX, ptrY)) // move there (hover effects, focus)
+                surfaceView.postDelayed(ptrLongPress, 500)
+            }
+            MotionEvent.ACTION_POINTER_DOWN -> { // second finger: scroll instead of drag
+                surfaceView.removeCallbacks(ptrLongPress)
+                if (ptrDragging) touchQueue.offer(msg(A_POS, 0, ptrX, ptrY))
+                ptrDragging = false; ptrDone = true
+                ptrMaxCount = maxOf(ptrMaxCount, e.pointerCount)
+                padLastY = (0 until e.pointerCount).map { e.getY(it) }.average().toFloat()
+                padLastX = (0 until e.pointerCount).map { e.getX(it) }.average().toFloat()
+                padAccX = 0f; padAccY = 0f
+            }
+            MotionEvent.ACTION_POINTER_UP -> {
+                val skip = e.actionIndex
+                val rest = (0 until e.pointerCount).filter { it != skip }
+                padLastX = rest.map { e.getX(it) }.average().toFloat()
+                padLastY = rest.map { e.getY(it) }.average().toFloat()
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (e.pointerCount >= 2) { // natural scrolling, like trackpad mode
+                    val density = resources.displayMetrics.density
+                    val cx = (0 until e.pointerCount).map { e.getX(it) }.average().toFloat()
+                    val cy = (0 until e.pointerCount).map { e.getY(it) }.average().toFloat()
+                    if (ptrMoved < slop) { // still a possible two-finger tap: measure from the base point
+                        ptrMoved = maxOf(ptrMoved, Math.abs(cx - padLastX) + Math.abs(cy - padLastY))
+                        if (ptrMoved < slop) return
+                    }
+                    padAccX += -(cx - padLastX) / density * 5f; padAccY += -(cy - padLastY) / density * 5f
+                    padLastX = cx; padLastY = cy
+                    val sx = padAccX.toInt().coerceIn(-32000, 32000); val sy = padAccY.toInt().coerceIn(-32000, 32000)
+                    if (sx != 0 || sy != 0) {
+                        padAccX -= sx; padAccY -= sy; ptrScrolled = true
+                        touchQueue.offer(msg(M_SCROLL, 0, sx, sy))
+                    }
+                    return
+                }
+                if (ptrDone) return
+                if (!ptrDragging) {
+                    if (Math.hypot((e.x - ptrDownX).toDouble(), (e.y - ptrDownY).toDouble()) < slop) return
+                    surfaceView.removeCallbacks(ptrLongPress)
+                    ptrDragging = true
+                    touchQueue.offer(msg(A_POS, A_LEFT, ptrX, ptrY)) // press where the finger went down
+                }
+                at(0)
+                if (touchQueue.size < 64) touchQueue.offer(msg(A_POS, A_LEFT, ptrX, ptrY))
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                surfaceView.removeCallbacks(ptrLongPress)
+                if (ptrDragging) {
+                    at(0)
+                    touchQueue.offer(msg(A_POS, 0, ptrX, ptrY))
+                } else if (e.actionMasked == MotionEvent.ACTION_UP) {
+                    if (ptrMaxCount == 1 && !ptrDone) { // a long press would have set ptrDone
+                        touchQueue.offer(msg(A_POS, A_LEFT, ptrX, ptrY) + msg(A_POS, 0, ptrX, ptrY)) // tap = click
+                    } else if (ptrMaxCount == 2 && !ptrScrolled && SystemClock.uptimeMillis() - ptrDownAt < 500) {
+                        touchQueue.offer(msg(A_POS, A_RIGHT, ptrX, ptrY) + msg(A_POS, 0, ptrX, ptrY)) // 2-finger tap
+                    }
+                }
+                ptrDragging = false; ptrDone = false; ptrActive = false
             }
         }
     }
@@ -937,6 +1110,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val pi = penIndex(e)
         if (pi >= 0) { // the pen wins: fingers (a resting palm) are ignored while it is on the screen
             releaseTouches()
+            ptrCancel()
             surfaceView.removeCallbacks(penExit)
             val penAction = e.actionIndex == pi
             when (e.actionMasked) {
@@ -949,6 +1123,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             return
         }
         if (trackpad) { onTrackpad(e); return }
+        if (settings.getInt("touch", 0) == 1 && hostFeatures and H_POINTER != 0) { onMouseTouch(v, e); return }
         val buf = ByteBuffer.allocate((e.pointerCount + 2) * 6)
         fun put(type: Int, i: Int) {
             val id = e.getPointerId(i)
@@ -1178,7 +1353,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
         if (!surfaceReady) error("Screen not ready")
         // 0.3.0 laptops: our features, preferences and the monitor size we want (older ones ignore these).
-        val features = F_INFO or F_BYE or (if (hevcDecoder) F_HEVC else 0)
+        val features = F_INFO or F_BYE or (if (hevcDecoder) F_HEVC else 0) or
+            (if (settings.getInt("clip", 1) == 1) F_CLIP else 0)
         val controls = ByteBuffer.allocate(7 * 6).apply {
             put(msg(C_HELLO, 0, features, 0))
             put(msg(C_PREF, P_FPS, settings.getInt("fps", 0), 0))
@@ -1228,6 +1404,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 if (len > buf.size) buf = ByteArray(len)
                 input.readFully(buf, 0, len)
                 if (flags and FLAG_BYE != 0) error("Disconnected from the laptop") // on purpose: don't reconnect
+                if (flags and FLAG_CLIP != 0) { // the laptop's clipboard (only sent because we asked with F_CLIP)
+                    if (len <= CLIP_MAX) receiveClip(String(buf, 0, len, Charsets.UTF_8))
+                    continue
+                }
                 if (flags and FLAG_INFO != 0) { // new stream follows: "<w> <h> <h264|hevc>"
                     val p = String(buf, 0, minOf(len, 64)).trim().split(" ")
                     val iw = p.getOrNull(0)?.toIntOrNull() ?: continue
@@ -1356,6 +1536,15 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         private const val FLAG_KEY = 2
         private const val FLAG_INFO = 4
         private const val FLAG_BYE = 8
+        private const val FLAG_CLIP = 16
+        private const val C_CLIP = 50
+        private const val F_CLIP = 8
+        private const val H_CLIP = 4
+        private const val H_POINTER = 8
+        private const val A_POS = 44
+        private const val A_LEFT = 1
+        private const val A_RIGHT = 2
+        private const val CLIP_MAX = 256 * 1024
         const val EXTRA_AUTO_LAST = "autoconnect_last"
         private const val C_VIEW = 20
         private const val C_PREF = 21
