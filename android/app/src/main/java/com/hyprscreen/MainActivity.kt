@@ -114,6 +114,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     @Volatile private var visible = false
     private var found = listOf<Laptop>()
     private var refreshPairCount: () -> Unit = {}
+    private val refreshSettingRows = mutableListOf<() -> Unit>() // the laptop can switch some while we stream
     @Volatile private var lastLaptopId: String? = null
     /** Touch messages waiting to be written to the laptop (one batch per MotionEvent). */
     private val touchQueue = LinkedBlockingQueue<ByteArray>() // unbounded: releases are never dropped
@@ -295,14 +296,48 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         if (sessionClaim.get() != null) disconnect() else @Suppress("DEPRECATION") super.onBackPressed()
     }
 
+    private var micRequestPending = false // main thread only
+
+    /** Ask for the mic permission unless a request is already showing (a second one is answered "no" at once). */
+    private fun requestMic() {
+        if (micRequestPending) return
+        micRequestPending = true
+        requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQ_MIC)
+    }
+
     private fun micAllowed() = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, results: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, results)
-        if (requestCode == REQ_MIC && results.firstOrNull() != PackageManager.PERMISSION_GRANTED) {
+        if (requestCode == REQ_MIC) micRequestPending = false
+        // Empty results: the request was interrupted (not a "no"), so the setting stays as it is.
+        if (requestCode == REQ_MIC && results.isNotEmpty() && results[0] != PackageManager.PERMISSION_GRANTED) {
             settings.edit().putInt("mic", 0).apply()
             Toast.makeText(this, "Phone mic stays off: it needs the microphone permission", Toast.LENGTH_LONG).show()
         }
+        if (requestCode == REQ_MIC) reportSettings() // the laptop turned the mic on: tell it how that went
+    }
+
+    /** Our clipboard / laptop audio / mic settings, as F_ bits (sent in HELLO and C_FEATURES). */
+    private fun syncFeatures() =
+        (if (settings.getInt("clip", 1) == 1) F_CLIP else 0) or
+            (if (settings.getInt("audio", 0) == 1) F_AUDIO else 0) or
+            (if (settings.getInt("mic", 0) == 1 && micAllowed()) F_MIC else 0)
+
+    private fun reportSettings() {
+        if (streaming && hostFeatures and H_SYNC != 0) touchQueue.offer(msg(C_FEATURES, 0, syncFeatures(), 0))
+    }
+
+    /** SETTINGS frame: the laptop switched these settings (bar widget); ours follow so both sides agree. */
+    private fun applyLaptopSettings(mask: Int, values: Int) {
+        val edit = settings.edit()
+        for ((bit, key) in listOf(F_CLIP to "clip", F_AUDIO to "audio", F_MIC to "mic"))
+            if (mask and bit != 0) edit.putInt(key, if (values and bit != 0) 1 else 0)
+        edit.apply()
+        if (mask and values and F_MIC != 0 && !micAllowed())
+            runOnUiThread { requestMic() } // the answer reports our settings (no mic off/on flap meanwhile)
+        else
+            reportSettings()
     }
 
     override fun onDestroy() {
@@ -436,12 +471,14 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
         for (o in opts) {
             fun cur() = settings.getInt(o.key, o.def).let { if (it in o.values) it else o.def }
-            row(o.label, { o.names[o.values.indexOf(cur())] }) {
+            val label = { o.names[o.values.indexOf(cur())] }
+            val view = row(o.label, label) {
                 val next = o.values[(o.values.indexOf(cur()) + 1) % o.values.size]
                 settings.edit().putInt(o.key, next).apply()
                 if (o.key == "mic" && next == 1 && !micAllowed())
-                    requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQ_MIC)
+                    requestMic()
             }
+            refreshSettingRows += { view.text = label() }
         }
         val orientNames = listOf("Landscape", "Portrait", "Auto-rotate")
         row("Orientation", { orientNames[settings.getInt("orient", 0).coerceIn(0, 2)] }) {
@@ -489,6 +526,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         padButton.visibility = if (streaming && hostFeatures and H_TRACKPAD != 0) View.VISIBLE else View.GONE
         if (!streaming) { setTrackpad(false); activeTouches.clear() }
         if (!streaming) hideKeyboard()
+        if (!streaming) refreshSettingRows.forEach { it() }
     }
 
     private fun renderList(laptops: List<Laptop>) = runOnUiThread {
@@ -1379,10 +1417,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
         if (!surfaceReady) error("Screen not ready")
         // 0.3.0 laptops: our features, preferences and the monitor size we want (older ones ignore these).
-        val features = F_INFO or F_BYE or (if (hevcDecoder) F_HEVC else 0) or
-            (if (settings.getInt("clip", 1) == 1) F_CLIP else 0) or
-            (if (settings.getInt("audio", 0) == 1) F_AUDIO else 0) or
-            (if (settings.getInt("mic", 0) == 1 && micAllowed()) F_MIC else 0)
+        val features = F_INFO or F_BYE or F_SYNC or (if (hevcDecoder) F_HEVC else 0) or syncFeatures()
         val controls = ByteBuffer.allocate(7 * 6).apply {
             put(msg(C_HELLO, 0, features, 0))
             put(msg(C_PREF, P_FPS, settings.getInt("fps", 0), 0))
@@ -1437,6 +1472,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 if (len > buf.size) buf = ByteArray(len)
                 input.readFully(buf, 0, len)
                 if (flags and FLAG_BYE != 0) error("Disconnected from the laptop") // on purpose: don't reconnect
+                if (flags and FLAG_SETTINGS != 0) { // the laptop switched clipboard / audio / mic (0.8.0+)
+                    if (len >= 2) applyLaptopSettings(buf[0].toInt() and 0xff, buf[1].toInt() and 0xff)
+                    continue
+                }
                 if (flags and FLAG_CLIP != 0) { // the laptop's clipboard (only sent because we asked with F_CLIP)
                     if (len <= CLIP_MAX) receiveClip(String(buf, 0, len, Charsets.UTF_8))
                     continue
@@ -1720,6 +1759,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         private const val FLAG_CLIP = 16
         private const val FLAG_AUDIO = 32
         private const val FLAG_MIC = 64
+        private const val FLAG_SETTINGS = 128
+        private const val F_SYNC = 64
+        private const val H_SYNC = 64
+        private const val C_FEATURES = 52
         private const val F_AUDIO = 16
         private const val F_MIC = 32
         private const val C_MIC = 51

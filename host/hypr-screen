@@ -33,6 +33,7 @@ import os
 import queue
 import re
 import select
+import shlex
 import shutil
 import signal
 import socket
@@ -44,7 +45,7 @@ import tempfile
 import threading
 import time
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 PORT = 7878
 OUTPUT = "HYPRSCREEN"
 PACKAGE = "com.hyprscreen"
@@ -61,6 +62,8 @@ H_CLIP = 4  # host feature (0.6.0+): clipboard sharing is on, the phone may send
 H_POINTER = 8  # host feature (0.6.0+): understands A_POS (touch works as a mouse)
 H_AUDIO = 16  # host feature (0.7.0+): the Hypr Screen sink is up, AUDIO frames may follow
 H_MIC = 32  # host feature (0.7.0+): the phone mic source is up, MIC frames say when to send C_MIC
+H_SYNC = 64  # host feature (0.8.0+): understands C_FEATURES and may send SETTINGS frames
+FLAG_SETTINGS = 128  # payload: 2 bytes, mask and values in F_CLIP/F_AUDIO/F_MIC bits: set these phone settings (0.8.0+)
 CLIP_MAX = 256 * 1024  # larger clipboard texts are not shared
 LINGER_SECONDS = 15  # keep a Wi-Fi phone's monitor this long while it reconnects
 START = b"\x00\x00\x00\x01"
@@ -413,10 +416,14 @@ F_INFO, F_HEVC, F_BYE = 1, 2, 4  # phone features: understands INFO frames; can 
 F_CLIP = 8  # phone feature (0.6.0+): wants clipboard sharing (CLIP frames)
 F_AUDIO = 16  # phone feature (0.7.0+): plays AUDIO frames
 F_MIC = 32  # phone feature (0.7.0+): can send its mic (C_MIC) when asked with MIC frames
+F_SYNC = 64  # phone feature (0.8.0+): clipboard/sound/mic settings sync both ways (SETTINGS frames, C_FEATURES)
+SYNC_BITS = {"clipboard": F_CLIP, "audio": F_AUDIO, "mic": F_MIC}
 # Clipboard (0.6.0): x << 16 | y = length, then that many bytes of UTF-8 text. Only sent to laptops with H_CLIP.
 C_CLIP = 50
 # Mic (0.7.0): same framing as C_CLIP, PCM s16le 48 kHz mono. Only sent after a MIC frame said 1.
 C_MIC = 51
+# Settings (0.8.0): x = the phone's F_CLIP/F_AUDIO/F_MIC bits now (after a SETTINGS frame, or a denied mic permission).
+C_FEATURES = 52
 MIC_MAX = 16384
 P_FPS, P_SCALE, P_CODEC, P_RES, P_MODE = 1, 2, 3, 4, 5  # P_MODE: 0 extend, 1 mirror  # PREF keys: fps; scale*100 (0 = laptop default); 1 = H.264 only; resolution %
 # Stylus (0.4.0): AUX carries x=pressure 0..65535, y=(tilt_x+90) | (tilt_y+90) << 8; POS slot = PEN_* flags.
@@ -933,6 +940,8 @@ class Session:
         self.audio = None  # AudioCapture while audio goes to the phone
         self.mic = None  # MicSource while the phone's mic is offered to apps
         self.mic_on = False  # what the last MIC frame told the phone
+        self.settings_changed = False  # set by the control thread: the stream thread applies them
+        self.push_settings = {}  # laptop toggles for the phone's app (F_SYNC phones): key -> on
         self.fps = int(cfg["fps"])
         self.scale_pref = 0  # 0 = laptop default
         self.res = 100
@@ -1354,7 +1363,7 @@ class Pipeline:
         self.frames = queue.Queue(maxsize=8)
         self.encoder, self.codec = s.choose()
         if s.features & F_INFO:  # tell the phone what is coming before the first config frame
-            info = f"{s.w} {s.h} {self.codec} {H_PEN | H_TRACKPAD | H_POINTER | (H_CLIP if s.clip else 0) | (H_AUDIO if s.audio else 0) | (H_MIC if s.mic else 0)}".encode()
+            info = f"{s.w} {s.h} {self.codec} {H_PEN | H_TRACKPAD | H_POINTER | (H_CLIP if s.clip else 0) | (H_AUDIO if s.audio else 0) | (H_MIC if s.mic else 0) | (H_SYNC if s.features & F_SYNC else 0)}".encode()
             sock.settimeout(10)
             sock.sendall(struct.pack(">IBI", len(info), FLAG_INFO, 0) + info)
         with open(os.path.join(self.tmp, "wf-recorder.log"), "w") as errlog:
@@ -1516,6 +1525,8 @@ class Daemon:
         self.linger_lock = threading.Lock()
         self.linger_token = None  # set while a disconnected Wi-Fi phone's monitor is kept
         self.kept_mic = None  # and its mic input, so calls don't move to the laptop mic
+        self.push_lock = threading.Lock()  # sess.push_settings: control thread adds, stream thread takes
+        self.audio_lock = threading.Lock()  # live sound toggles run pactl off the stream thread, one at a time
         self.pair_quiet_until = 0.0
         self.active = None  # the connected phone: device, name, via, since, conn, session
         self.last_device = None  # device of the most recent session (for a kick while its monitor lingers)
@@ -1559,6 +1570,10 @@ class Daemon:
                 reply = {"ended": self.kick()}
             elif cmd == "forget" and len(req) == 2:
                 reply = {"ended": self.kick(req[1])}
+            elif cmd == "info":
+                reply = self.info()
+            elif cmd == "reload":
+                reply = self.reload(req[1] if len(req) == 2 else None)
             else:
                 reply = {"error": "unknown command"}
             try:
@@ -1610,6 +1625,36 @@ class Daemon:
             tip += f"\nlink busy: quality level {s.level}"
         cls = "mirror" if s.mirror else "connected"
         return {"text": "\U000f011c", "tooltip": tip, "class": cls, "alt": cls}
+
+    def info(self):
+        """The connected phone for --state (the Omarchy bar plugin), or None."""
+        a = self.active
+        if not a:
+            return {"connected": None}
+        s = a["session"]
+        return {"connected": {
+            "device": a["device"], "name": a["name"], "via": a["via"], "since": int(a["since"]),
+            "mirror": bool(s.mirror), "target": s.target, "width": s.w, "height": s.h, "fps": s.eff_fps(),
+            "level": s.level, "clipboard": bool(s.clip), "audio": bool(s.audio), "mic": bool(s.mic),
+            "sync": bool(s.features & F_SYNC), "phone": {k: bool(s.features & b) for k, b in SYNC_BITS.items()}}}
+
+    def reload(self, changed=None):
+        """Settings read per session (clipboard, audio, mic): apply them to the connected phone (and, with
+        F_SYNC, switch the same setting in its app), else to the next one."""
+        try:
+            new = load_config()
+        except (OSError, ValueError) as e:
+            return {"error": str(e)}
+        for key in LIVE_SETTINGS:
+            self.cfg[key] = new.get(key, DEFAULTS[key])
+        a = self.active
+        if a:
+            sess = a["session"]
+            if changed in SYNC_BITS and sess.features & F_SYNC:
+                with self.push_lock:
+                    sess.push_settings[changed] = bool(self.cfg[changed])
+            sess.settings_changed = True  # the stream thread applies them to this phone now
+        return {"ok": True, "live": bool(a)}
 
     # ---- TCP: TLS + challenge, then one display session at a time
     def serve(self):
@@ -1834,6 +1879,8 @@ class Daemon:
         have_monitor = False
         try:
             buf = sess.read_initial(sock)  # 0.3.0+ phones announce features/size/prefs first
+            if sess.features & F_SYNC:
+                self.phone_wins(sess)
             if sess.mirror:
                 mon = mirror_target(self.cfg)
                 if not mon:
@@ -1883,8 +1930,9 @@ class Daemon:
             self.active = None
             if sess.clip:
                 quietly(sess.clip.stop)
-            if sess.audio:
-                quietly(sess.audio.stop)
+            with self.audio_lock:
+                if sess.audio:
+                    quietly(sess.audio.stop)
             if pipe:
                 pipe.stop()
             for dev in ("touch", "pen", "mouse", "pointer"):
@@ -1926,6 +1974,71 @@ class Daemon:
         t.daemon = True
         t.start()
 
+    def sync_audio(self, sess):
+        """Start or stop laptop sound for the running session to match the settings."""
+        with self.audio_lock:
+            a = self.active
+            if not a or a["session"] is not sess:
+                return
+            want = bool(sess.features & F_AUDIO and self.cfg.get("audio", True))
+            if want and not sess.audio:
+                sess.audio = AudioCapture.start()
+            elif not want and sess.audio:
+                old, sess.audio = sess.audio, None
+                quietly(old.stop)
+                quietly(remove_sink)  # apps on it move back to the laptop's output
+            log(f"sound to the phone {'on' if sess.audio else 'off'}")
+
+    def phone_wins(self, sess):
+        """At connect, the laptop takes the sync phone's clipboard/sound/mic settings. A toggle made in the
+        bar while it was connecting is newer: that one stays and goes to the phone."""
+        with self.push_lock:
+            changes = {k: bool(sess.features & b) for k, b in SYNC_BITS.items()}
+            changes.update(sess.push_settings)
+        for key, on in changes.items():
+            if bool(self.cfg.get(key, True)) != on:
+                self.cfg[key] = on
+                try:
+                    write_config(key, on)
+                except (OSError, ValueError) as e:
+                    log(f"can't save {key}: {e}")
+
+    def apply_settings(self, sock, sess):
+        """Clipboard, sound or mic switched on the laptop (the bar widget): start or stop them mid-session.
+        Only for what the phone asked for (its F_ flags). F_SYNC phones get the laptop's toggles first."""
+        with self.push_lock:
+            push, sess.push_settings = sess.push_settings, {}
+        if push:
+            mask = vals = 0
+            for key, on in push.items():
+                bit = SYNC_BITS[key]
+                mask |= bit
+                vals |= bit if on else 0
+            sess.features = sess.features & ~mask | vals  # assume yes; C_FEATURES corrects it (mic permission)
+            sock.settimeout(10)
+            sock.sendall(struct.pack(">IBIBB", 2, FLAG_SETTINGS, 0, mask, vals))
+        want = bool(sess.features & F_CLIP and self.cfg.get("clipboard", True))
+        if want != bool(sess.clip):
+            if sess.clip:
+                quietly(sess.clip.stop)
+                sess.clip = None
+            else:
+                sess.clip = ClipSync.start()
+            sess.dirty_at = time.monotonic()  # restart the stream: its INFO tells the phone (H_CLIP)
+        threading.Thread(target=self.sync_audio, args=(sess,), daemon=True).start()  # pactl can be slow
+        want = bool(sess.features & F_MIC and self.cfg.get("mic", True))
+        if want != bool(sess.mic):
+            if sess.mic:
+                if sess.mic_on:  # the phone is recording: tell it to stop
+                    sess.mic_on = False
+                    sock.settimeout(10)
+                    sock.sendall(struct.pack(">IBIB", 1, FLAG_MIC, 0, 0))
+                quietly(sess.mic.stop)
+                sess.mic = None
+            else:
+                sess.mic = MicSource.start()
+        log(f"settings applied: clipboard {'on' if sess.clip else 'off'}, mic {'on' if sess.mic else 'off'}")
+
     def drop_kept_mic(self):
         kept, self.kept_mic = self.kept_mic, None
         if kept:
@@ -1947,6 +2060,9 @@ class Daemon:
                     sock.settimeout(2)
                     sock.sendall(struct.pack(">IBI", 0, FLAG_BYE, 0))
                 return True
+            if sess.settings_changed:
+                sess.settings_changed = False
+                self.apply_settings(sock, sess)
             try:
                 frame = pipe.frames.get(timeout=0.004)
             except queue.Empty:
@@ -1969,8 +2085,9 @@ class Daemon:
             if clip is not None:
                 sock.settimeout(10)
                 sock.sendall(struct.pack(">IBI", len(clip), FLAG_CLIP, 0) + clip)
-            while sess.audio:
-                pcm = sess.audio.take()
+            while True:
+                audio = sess.audio  # a live toggle may swap it from another thread
+                pcm = audio.take() if audio else None
                 if pcm is None:
                     break
                 sock.settimeout(10)
@@ -2027,6 +2144,11 @@ class Daemon:
                     self.pen_msg(*msg)
                 elif C_VIEW <= kind <= C_BYE:
                     sess.control(*msg)
+                elif kind == C_FEATURES:
+                    sync = sum(SYNC_BITS.values())
+                    sess.features = sess.features & ~sync | msg[2] & sync
+                    sess.mic_on = False  # resend "mic in use": the phone may have just got the permission
+                    sess.settings_changed = True
                 elif kind >= 30:
                     pass  # from a newer phone: ignore
                 elif kind >= K_TAP:
@@ -2209,6 +2331,176 @@ def uninstall_service():
     print("hypr-screen service removed. Pairing keys stay in ~/.config/hypr-screen (delete it to revoke them).")
 
 
+# --------------------------------------------------------------------- JSON CLI (the Omarchy bar plugin)
+
+LIVE_SETTINGS = ("clipboard", "audio", "mic")  # read per session: a reload is enough
+SETTINGS = ("wifi",) + LIVE_SETTINGS  # wifi changes the listening socket: the service restarts
+PLUGIN_ID = "kpanuragh.hypr-screen"
+PLUGIN_DIR = os.path.expanduser(f"~/.config/omarchy/plugins/{PLUGIN_ID}")
+
+
+def service_state():
+    """active / inactive / failed / ..., or "missing" when the systemd unit isn't installed."""
+    if not os.path.exists(UNIT_PATH):
+        return "missing"
+    r = subprocess.run(["systemctl", "--user", "is-active", "hypr-screen.service"],
+                       capture_output=True, text=True, timeout=5)
+    return r.stdout.strip() or "unknown"
+
+
+def state():
+    info = ask_daemon("info")
+    try:
+        cfg = load_config()
+    except (OSError, ValueError):
+        cfg = dict(DEFAULTS)
+    devices = []
+    for dev, i in load_devices().items():
+        i = i if isinstance(i, dict) else {}
+        added = i.get("added", 0)
+        devices.append({"id": str(dev), "name": str(i.get("name", "?")),
+                        "added": int(added) if isinstance(added, (int, float)) else 0})
+    devices.sort(key=lambda d: -d["added"])
+    return {"version": VERSION, "running": info is not None, "service": service_state(),
+            "connected": (info or {}).get("connected"), "devices": devices,
+            "settings": {k: bool(cfg.get(k, DEFAULTS[k])) for k in SETTINGS}}
+
+
+def write_config(key, value):
+    """Change one key in config.json; the other keys stay as the user wrote them."""
+    load_config()  # creates the file and the directory on first use
+    lock = os.open(os.path.join(CONF_DIR, ".config.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)  # the service (phone wins) and --set may both write
+        _write_config(key, value)
+    finally:
+        os.close(lock)
+
+
+def _write_config(key, value):
+    path = os.path.realpath(os.path.join(CONF_DIR, "config.json"))  # keep a dotfiles symlink
+    with open(path) as f:
+        raw = json.load(f)
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path} is not a JSON object")
+    raw[key] = value
+    mode = os.stat(path).st_mode & 0o777
+    fd, tmp = tempfile.mkstemp(prefix=".config-", dir=os.path.dirname(path))
+    with os.fdopen(fd, "w") as f:
+        json.dump(raw, f, indent=2)
+        f.write("\n")
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def set_setting(key, value):
+    """Change one setting in config.json, then apply it (and switch it on a connected phone that syncs)."""
+    write_config(key, value)
+    applied, restarted = "next", False
+    if ask_daemon("status") is not None:
+        if key in LIVE_SETTINGS:
+            r = ask_daemon("reload", key) or {}
+            applied = ("now" if r.get("live") else "next") if r.get("ok") else "restart"
+        elif service_state() == "active":
+            subprocess.run(["systemctl", "--user", "restart", "hypr-screen.service"], check=True, timeout=30)
+            applied, restarted = "now", True
+        else:
+            applied = "restart"
+    return {"ok": True, "key": key, "value": value, "applied": applied, "restarted": restarted}
+
+
+def pactl_json(*args):
+    out = subprocess.run(["pactl", "-f", "json", *args], capture_output=True, text=True, timeout=5, check=True).stdout
+    return json.loads(out or "[]")
+
+
+def audio_apps():
+    """Streams playing to a sound output: [{id, name, title, on_phone}]. Empty without our sink."""
+    if not shutil.which("pactl"):
+        return {"error": "pactl not found (sudo pacman -S libpulse)"}
+    sinks = {s["index"]: s["name"] for s in pactl_json("list", "short", "sinks")}
+    if SINK not in sinks.values():
+        return {"sink": False, "apps": []}
+    apps = []
+    for si in pactl_json("list", "sink-inputs"):
+        props = si.get("properties") or {}
+        name = props.get("application.name") or props.get("application.process.binary") or "Unknown"
+        apps.append({"id": si["index"], "name": str(name), "title": str(props.get("media.name") or ""),
+                     "on_phone": sinks.get(si.get("sink")) == SINK})
+    return {"sink": True, "apps": apps}
+
+
+def move_audio(stream, where):
+    if not stream.isdigit():
+        sys.exit(f"stream id must be a number (see --audio-apps): {stream}")
+    if where == "phone":
+        target = SINK
+    else:
+        target = run("pactl", "get-default-sink", timeout=5).strip()
+        if target == SINK:  # the phone is the default: back to the first other output
+            others = [s["name"] for s in pactl_json("list", "short", "sinks") if s["name"] != SINK]
+            if not others:
+                sys.exit("no other sound output")
+            target = others[0]
+    r = subprocess.run(["pactl", "move-sink-input", stream, target], capture_output=True, text=True, timeout=5)
+    if r.returncode:
+        sys.exit(r.stderr.strip() or "pactl move-sink-input failed")
+
+
+def omarchy_plugin_source():
+    here = os.path.dirname(os.path.realpath(os.path.abspath(sys.argv[0])))
+    for d in (os.path.join(here, "omarchy"), os.path.join(here, "..", "omarchy"),
+              os.path.expanduser("~/.local/share/hypr-screen/omarchy")):
+        if os.path.isfile(os.path.join(d, "manifest.json")):
+            return os.path.normpath(d)
+    return None
+
+
+def omarchy_bar_has_plugin():
+    try:
+        with open(os.path.expanduser("~/.config/omarchy/shell.json")) as f:
+            layout = json.load(f).get("bar", {}).get("layout", {})
+        return any(isinstance(m, dict) and m.get("id") == PLUGIN_ID
+                   for section in layout.values() if isinstance(section, list) for m in section)
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def install_omarchy():
+    """Copy the bar plugin into ~/.config/omarchy/plugins and add it to the bar (Omarchy only)."""
+    if not (shutil.which("omarchy") and shutil.which("omarchy-shell")):
+        sys.exit("Omarchy not found: the bar plugin is for the Omarchy shell only (Waybar: see the README)")
+    src = omarchy_plugin_source()
+    if not src:
+        sys.exit("plugin files not found (the omarchy/ folder of the release or git checkout)")
+    exe = service_exe()
+    os.makedirs(os.path.join(PLUGIN_DIR, "bin"), exist_ok=True)
+    for name in os.listdir(src):
+        if os.path.isfile(os.path.join(src, name)) and not os.path.islink(os.path.join(src, name)):
+            shutil.copyfile(os.path.join(src, name), os.path.join(PLUGIN_DIR, name))
+    wrapper = os.path.join(PLUGIN_DIR, "bin", "hypr-screen")
+    with open(wrapper, "w") as f:  # the shell's PATH may not have ~/.local/bin or the mise shims
+        f.write(f"#!/bin/sh\nexec {shlex.quote(exe)} \"$@\"\n")
+    os.chmod(wrapper, 0o755)
+    subprocess.run(["omarchy-shell", "shell", "rescanPlugins"], capture_output=True, timeout=15)
+    if omarchy_bar_has_plugin():  # an update: keep it where the user put it
+        print(f"Hypr Screen bar widget updated ({PLUGIN_DIR}).")
+        return
+    r = subprocess.run(["omarchy", "plugin", "enable", PLUGIN_ID, "--section", "right"],
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode:
+        print(f"Plugin copied to {PLUGIN_DIR}, but enabling it failed: {(r.stderr or r.stdout).strip()}")
+        print(f"Try: omarchy plugin enable {PLUGIN_ID} --section right")
+    else:
+        print(f"Hypr Screen bar widget installed ({PLUGIN_DIR}) and added to the right of the bar.")
+    try:
+        with open(os.path.expanduser("~/.config/omarchy/shell.json")) as f:
+            if "hypr-screen --status" in f.read():
+                print("Your shell.json still has the old \"command\" module running hypr-screen --status; remove it.")
+    except OSError:
+        pass
+
+
 def main():
     ap = argparse.ArgumentParser(description="Use an Android phone as a Hyprland monitor (background service).")
     ap.add_argument("--no-usb", action="store_true", help="don't watch for USB phones")
@@ -2222,6 +2514,13 @@ def main():
     ap.add_argument("--status", action="store_true", help="print the connection state as Waybar/Omarchy bar JSON")
     ap.add_argument("--disconnect", action="store_true", help="end the current phone session")
     ap.add_argument("--move-window", action="store_true", help="move the focused window to the phone's monitor")
+    ap.add_argument("--state", action="store_true", help="print service, phone, paired phones and settings as JSON")
+    ap.add_argument("--set", nargs=2, metavar=("KEY", "on|off"),
+                    help=f"turn a setting on or off ({', '.join(SETTINGS)}) and apply it")
+    ap.add_argument("--audio-apps", action="store_true", help="list apps playing sound as JSON")
+    ap.add_argument("--move-audio", nargs=2, metavar=("ID", "phone|laptop"),
+                    help="move an app's sound (id from --audio-apps) to the phone or back")
+    ap.add_argument("--install-omarchy", action="store_true", help="install the Omarchy bar widget (Omarchy only)")
     ap.add_argument("--confirm-pair", nargs=4, metavar=("RESULT", "NAME", "ADDR", "CODE"), help=argparse.SUPPRESS)
     args = ap.parse_args()
     if args.install_service:
@@ -2262,6 +2561,26 @@ def main():
         return
     if args.move_window:
         move_window_to_phone()
+        return
+    if args.state:
+        print(json.dumps(state(), ensure_ascii=False))
+        return
+    if args.set:
+        key, val = args.set
+        if key not in SETTINGS or val not in ("on", "off"):
+            sys.exit(f"usage: --set {{{','.join(SETTINGS)}}} {{on,off}}")
+        print(json.dumps(set_setting(key, val == "on")))
+        return
+    if args.audio_apps:
+        print(json.dumps(audio_apps(), ensure_ascii=False))
+        return
+    if args.move_audio:
+        if args.move_audio[1] not in ("phone", "laptop"):
+            sys.exit("usage: --move-audio ID {phone,laptop}")
+        move_audio(*args.move_audio)
+        return
+    if args.install_omarchy:
+        install_omarchy()
         return
     for tool in ("hyprctl", "wf-recorder", "openssl"):
         if not shutil.which(tool):

@@ -18,7 +18,7 @@ Plug the phone in over USB and it becomes a real Hyprland output next to your la
 - **Display settings on the phone.** Resolution, frame rate (a 50% / 30 fps battery saver), text size and codec.
 - **Plug-and-play USB.** A background service notices the phone, opens the app and connects. Nothing to run by hand.
 - **One tap on the phone.** Opening the app connects to the laptop you used last as soon as it is found on your network. A Quick Settings tile does the same from anywhere.
-- **Bar widget and shortcuts.** Show the connection in Waybar or the Omarchy bar, end it from the laptop, and send the focused window to the phone with a key.
+- **Bar widget and shortcuts.** Show the connection in Waybar or the Omarchy bar (with a panel for paired phones, settings and app sound), end it from the laptop, and send the focused window to the phone with a key.
 - **Wi-Fi (opt-in).** The app discovers your laptop on the local network. Pair once by tapping **Pair** and accepting on the laptop (like Bluetooth), or just plug in USB once. On a slow network, quality and then frame rate step down automatically and come back when it recovers. If Wi-Fi drops, the phone reconnects by itself, and the laptop keeps its monitor (and your windows on it) for 15 seconds.
 - **Secure by default.** Every connection is TLS 1.3 with a pinned certificate, and the phone must prove it holds its pairing key.
 - **Multitouch.** A virtual touchscreen is mapped onto the phone's monitor, so you can tap, drag, scroll and pinch.
@@ -104,7 +104,7 @@ To connect from anywhere on the phone, add the **Hypr Screen** tile: pull down Q
 ### 4. Laptop shortcuts and bar widget
 
 ```sh
-hypr-screen --status        # JSON for Waybar / the Omarchy bar
+hypr-screen --status        # JSON for Waybar
 hypr-screen --disconnect    # end the session (the phone doesn't reconnect)
 hypr-screen --move-window   # send the focused window to the phone
 ```
@@ -115,11 +115,21 @@ Bind a key to move windows. On Omarchy, add this to `~/.config/hypr/bindings.lua
 o.bind("SUPER + SHIFT + P", "Move window to phone", "hypr-screen --move-window")
 ```
 
-**Omarchy bar:** add a module to a section of `bar.layout` in `~/.config/omarchy/shell.json`, for example next to the clock:
+**Omarchy bar:** `host/install.sh` adds a Hypr Screen widget to the bar when it finds Omarchy (with mise or the release tarball, run `hypr-screen --install-omarchy`). The phone icon is dimmed while no phone is connected. Click it for a panel to:
 
-```json
-{ "id": "hypr-screen", "type": "command", "exec": "hypr-screen --status", "interval": 5,
-  "tooltip": "Phone display", "onClick": "hypr-screen --disconnect" }
+- see the connected phone, disconnect it, or move the focused window to it (middle-click the icon also disconnects);
+- forget phones paired over Wi-Fi;
+- turn Wi-Fi, the shared clipboard, laptop sound and the phone mic on or off;
+- while the phone plays laptop sound, choose which apps play on it;
+- start or stop the service.
+
+To hide the icon while idle, set `"hideWhenIdle": true` on its entry in `bar.layout` of `~/.config/omarchy/shell.json`. Remove it with `omarchy plugin remove kpanuragh.hypr-screen`. On other desktops nothing is installed; use Waybar below. The widget uses these commands, which are handy in scripts too:
+
+```sh
+hypr-screen --state                 # service, connected phone, paired phones, settings (JSON)
+hypr-screen --set mic off           # wifi, clipboard, audio, mic: on/off (wifi restarts the service)
+hypr-screen --audio-apps            # apps playing sound (JSON)
+hypr-screen --move-audio ID phone   # or laptop
 ```
 
 **Waybar:**
@@ -155,6 +165,8 @@ The widget shows a phone icon while a phone is connected (class `connected` or `
 | `clipboard` | `true` | Share clipboard text with phones that turn it on (needs `wl-clipboard`) |
 | `audio` | `true` | Offer the Hypr Screen (phone) sound output to phones that turn audio on |
 | `mic` | `true` | Offer the Hypr Screen (phone) mic input to phones that turn the mic on |
+
+`clipboard`, `audio` and `mic` are kept in step with the phone app (0.8.0 on both sides): when a phone connects, the laptop takes the app's three settings, and switching one on the laptop while it is connected (`hypr-screen --set`, or the Omarchy bar widget) also switches it in the app. They apply at once, without reconnecting.
 | `phones` | `{}` | Per-phone `position` and `workspaces`, keyed by the id from `--devices` (or `"usb"`) |
 
 Example for a phone that sits below the laptop screen and gets workspace 9:

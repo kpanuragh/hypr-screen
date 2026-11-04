@@ -1,0 +1,3 @@
+* Clipboard, laptop audio and phone mic settings follow the laptop: switching one in the Omarchy bar widget while connected also switches it in the app
+* When the phone connects, the laptop takes the app's clipboard, audio and mic settings
+* Needs Hypr Screen 0.8.0 on the laptop for these; older laptops keep working as before

@@ -1,0 +1,9 @@
+#!/bin/sh
+# Runs hypr-screen (https://github.com/kpanuragh/hypr-screen) for the bar widget: the shell's PATH may not
+# have ~/.local/bin or the mise shims. `hypr-screen --install-omarchy` replaces this with the exact path.
+for exe in "$HOME/.local/bin/hypr-screen" "${MISE_DATA_DIR:-$HOME/.local/share/mise}/shims/hypr-screen"; do
+  [ -x "$exe" ] && exec "$exe" "$@"
+done
+command -v hypr-screen >/dev/null 2>&1 && exec hypr-screen "$@"
+echo "hypr-screen is not installed: https://github.com/kpanuragh/hypr-screen" >&2
+exit 127

@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "id": "kpanuragh.hypr-screen",
+  "name": "Hypr Screen",
+  "version": "0.8.0",
+  "author": "kpanuragh",
+  "license": "MIT",
+  "description": "Phone-as-monitor status and controls for hypr-screen.",
+  "homepage": "https://github.com/kpanuragh/hypr-screen",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Hypr Screen",
+    "description": "See the connected phone, disconnect it, forget paired phones, change settings and send windows or app sound to the phone.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "hideWhenIdle": false,
+      "refreshIntervalSec": 5
+    },
+    "schema": [
+      {
+        "key": "hideWhenIdle",
+        "type": "boolean",
+        "label": "Hide when idle",
+        "description": "Show the icon only while a phone is connected.",
+        "defaultValue": false
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 2,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 5
+      }
+    ]
+  }
+}
