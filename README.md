@@ -216,7 +216,7 @@ This needs JDK 17+ and the Android SDK (platform 36), with the SDK path in `ANDR
 - Only one phone at a time.
 - A floating phone keyboard still floats over the picture (drag it aside, or use a docked keyboard, which the picture shrinks to make room for).
 - Characters outside the US layout are typed through `wtype`, one at a time.
-- Audio only goes to the phone for apps you move to the Hypr Screen (phone) output; there is no automatic switch.
+- Laptop sound plays on the phone only for the apps you send there (the Omarchy bar widget, pavucontrol or `pactl`); everything else stays on the laptop. The phone mic is used only by apps that pick the Hypr Screen (phone) mic input.
 - Mirror mode sends the mirrored monitor at its full resolution (up to 4096 pixels wide); the phone's Resolution setting doesn't apply to it.
 - Tested on: Omarchy, Hyprland 0.56, Intel Iris Xe, OnePlus (Android 17). Reports from other setups are welcome.
 
