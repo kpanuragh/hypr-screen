@@ -29,6 +29,8 @@ Plug the phone in over USB and it becomes a real Hyprland output next to your la
   - Three-finger tap for middle-click; three-finger swipe to switch workspace.
 - **Touch as mouse.** For apps that ignore touch (kitty and other terminals), set **Touch input → Mouse** on the phone: tap to click, drag to select text, long-press or two-finger tap to right-click, two fingers to scroll.
 - **Shared clipboard.** Text copied on the laptop can be pasted on the phone, and text copied on the phone reaches the laptop when you switch back to Hypr Screen (or tap 📋 on the key row). Passwords marked sensitive by a password manager are never shared. Turn it off with **Shared clipboard → Off** on the phone. Needs `wl-clipboard` on the laptop.
+- **Laptop audio on the phone.** Turn on **Laptop audio → Play on the phone** and, while the phone is connected, the laptop gets an extra sound output called **Hypr Screen (phone)**. Move an app to it (pavucontrol, or `pactl move-sink-input`) and its sound plays on the phone; everything else stays on the laptop. WirePlumber remembers the choice for next time. Off by default. Needs `pactl` and `parec` (pipewire-pulse/libpulse).
+- **Phone mic for calls.** Turn on **Phone mic** (it asks for the microphone permission once) and the laptop gets an input called **Hypr Screen (phone) mic**. Pick it in Meet, Zoom, Discord and so on. The phone records only while an app on the laptop is listening, using Android's call mode with echo cancelling; during that time laptop sound on the phone plays as call audio, through a plugged-in headset if there is one, else the loudspeaker. Anything that opens the input counts as listening, including level meters such as pavucontrol's Input Devices tab, so don't make it your default input unless you want the phone mic always on. Off by default. Needs `pw-cat` (pipewire).
 - **Keyboard.** Type with the phone keyboard; the picture shrinks to stay visible above it. An extra key row gives `Esc Tab Ctrl Alt Super ← ↑ ↓ → 📋`, and the modifiers are sticky, so Super then 1 switches workspace. A Bluetooth keyboard paired to the phone is passed straight through.
 
 ## Requirements
@@ -151,6 +153,8 @@ The widget shows a phone icon while a phone is connected (class `connected` or `
 | `workspaces` | `[]` | Workspaces to put on the phone while it is connected, e.g. `[8, 9]` or `["name:chat"]` |
 | `mirror_output` | `""` | Monitor shown in mirror mode (`""` = the focused one), e.g. `"eDP-1"` |
 | `clipboard` | `true` | Share clipboard text with phones that turn it on (needs `wl-clipboard`) |
+| `audio` | `true` | Offer the Hypr Screen (phone) sound output to phones that turn audio on |
+| `mic` | `true` | Offer the Hypr Screen (phone) mic input to phones that turn the mic on |
 | `phones` | `{}` | Per-phone `position` and `workspaces`, keyed by the id from `--devices` (or `"usb"`) |
 
 Example for a phone that sits below the laptop screen and gets workspace 9:
@@ -200,7 +204,7 @@ This needs JDK 17+ and the Android SDK (platform 36), with the SDK path in `ANDR
 - Only one phone at a time.
 - A floating phone keyboard still floats over the picture (drag it aside, or use a docked keyboard, which the picture shrinks to make room for).
 - Characters outside the US layout are typed through `wtype`, one at a time.
-- No audio. Audio keeps playing on the laptop.
+- Audio only goes to the phone for apps you move to the Hypr Screen (phone) output; there is no automatic switch.
 - Mirror mode sends the mirrored monitor at its full resolution (up to 4096 pixels wide); the phone's Resolution setting doesn't apply to it.
 - Tested on: Omarchy, Hyprland 0.56, Intel Iris Xe, OnePlus (Android 17). Reports from other setups are welcome.
 

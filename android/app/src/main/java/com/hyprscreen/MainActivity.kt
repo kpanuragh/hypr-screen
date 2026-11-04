@@ -12,6 +12,17 @@ import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.Manifest
+import android.content.pm.PackageManager
+import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
+import android.media.AudioFormat
+import android.media.AudioManager
+import android.media.AudioRecord
+import android.media.AudioTrack
+import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.NoiseSuppressor
 import android.media.MediaCodec
 import android.media.MediaCodecList
 import android.media.MediaFormat
@@ -106,6 +117,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     @Volatile private var lastLaptopId: String? = null
     /** Touch messages waiting to be written to the laptop (one batch per MotionEvent). */
     private val touchQueue = LinkedBlockingQueue<ByteArray>() // unbounded: releases are never dropped
+    private val micQueued = java.util.concurrent.atomic.AtomicInteger() // mic chunks in touchQueue
     @Volatile private var streaming = false
 
     private lateinit var keyCatcher: KeyCatcher
@@ -283,6 +295,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         if (sessionClaim.get() != null) disconnect() else @Suppress("DEPRECATION") super.onBackPressed()
     }
 
+    private fun micAllowed() = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, results: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, results)
+        if (requestCode == REQ_MIC && results.firstOrNull() != PackageManager.PERMISSION_GRANTED) {
+            settings.edit().putInt("mic", 0).apply()
+            Toast.makeText(this, "Phone mic stays off: it needs the microphone permission", Toast.LENGTH_LONG).show()
+        }
+    }
+
     override fun onDestroy() {
         alive = false
         disconnect()
@@ -390,6 +412,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             Opt("Mode", "mode", listOf(0, 1), listOf("Extra monitor", "Mirror laptop screen"), 0),
             Opt("Auto-connect", "auto", listOf(1, 0), listOf("Last laptop, when found", "Off"), 1),
             Opt("Shared clipboard", "clip", listOf(1, 0), listOf("On", "Off"), 1),
+            Opt("Laptop audio", "audio", listOf(0, 1), listOf("Off", "Play on the phone"), 0),
+            Opt("Phone mic", "mic", listOf(0, 1), listOf("Off", "Laptop can use it (calls)"), 0),
             Opt("Touch input", "touch", listOf(0, 1), listOf("Touchscreen", "Mouse (tap clicks, drag selects)"), 0),
         )
         val panel = LinearLayout(this).apply {
@@ -415,6 +439,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             row(o.label, { o.names[o.values.indexOf(cur())] }) {
                 val next = o.values[(o.values.indexOf(cur()) + 1) % o.values.size]
                 settings.edit().putInt(o.key, next).apply()
+                if (o.key == "mic" && next == 1 && !micAllowed())
+                    requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQ_MIC)
             }
         }
         val orientNames = listOf("Landscape", "Portrait", "Auto-rotate")
@@ -1354,7 +1380,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         if (!surfaceReady) error("Screen not ready")
         // 0.3.0 laptops: our features, preferences and the monitor size we want (older ones ignore these).
         val features = F_INFO or F_BYE or (if (hevcDecoder) F_HEVC else 0) or
-            (if (settings.getInt("clip", 1) == 1) F_CLIP else 0)
+            (if (settings.getInt("clip", 1) == 1) F_CLIP else 0) or
+            (if (settings.getInt("audio", 0) == 1) F_AUDIO else 0) or
+            (if (settings.getInt("mic", 0) == 1 && micAllowed()) F_MIC else 0)
         val controls = ByteBuffer.allocate(7 * 6).apply {
             put(msg(C_HELLO, 0, features, 0))
             put(msg(C_PREF, P_FPS, settings.getInt("fps", 0), 0))
@@ -1371,12 +1399,14 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         s.soTimeout = 0
         setStatus("Connected to ${l.name}")
         touchQueue.clear()
+        micQueued.set(0)
         streaming = true
         val out = s.outputStream
         val writer = thread(name = "input-writer", isDaemon = true) {
             try {
                 while (streaming) {
                     val msg = touchQueue.poll(500, TimeUnit.MILLISECONDS) ?: continue
+                    if (msg[0].toInt() == C_MIC) micQueued.decrementAndGet()
                     out.write(msg)
                     out.flush()
                 }
@@ -1394,6 +1424,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     private fun stream(input: DataInputStream, w: Int, h: Int) {
         var decoder: Decoder? = null
+        var audio: AudioOut? = null
+        var audioFailed = false
+        var mic: MicIn? = null
         try {
             var buf = ByteArray(1 shl 20)
             while (alive) {
@@ -1406,6 +1439,28 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 if (flags and FLAG_BYE != 0) error("Disconnected from the laptop") // on purpose: don't reconnect
                 if (flags and FLAG_CLIP != 0) { // the laptop's clipboard (only sent because we asked with F_CLIP)
                     if (len <= CLIP_MAX) receiveClip(String(buf, 0, len, Charsets.UTF_8))
+                    continue
+                }
+                if (flags and FLAG_AUDIO != 0) { // laptop sound (only sent because we asked with F_AUDIO)
+                    val call = mic?.active == true // call audio only while the mic really records
+                    if (audio != null && audio.call != call) {
+                        audio.release() // switch between media and call playback
+                        audio = null
+                        audioFailed = false
+                    }
+                    if (audio == null && !audioFailed) {
+                        audio = AudioOut.create(call)
+                        audioFailed = audio == null
+                    }
+                    audio?.write(buf, len)
+                    continue
+                }
+                if (flags and FLAG_MIC != 0) { // an app on the laptop started or stopped listening to our mic
+                    val on = len > 0 && buf[0].toInt() == 1 && micAllowed()
+                    if (on != (mic != null)) {
+                        mic?.stop()
+                        mic = if (on) MicIn() else null
+                    }
                     continue
                 }
                 if (flags and FLAG_INFO != 0) { // new stream follows: "<w> <h> <h264|hevc>"
@@ -1432,6 +1487,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             }
         } finally {
             decoder?.release()
+            audio?.release()
+            mic?.stop()
         }
     }
 
@@ -1467,6 +1524,130 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     // ---------------------------------------------------------------- decoder
 
     @Volatile private var mime = MediaFormat.MIMETYPE_VIDEO_AVC
+
+    /** PCM s16le 48 kHz stereo from the laptop. Writes never block, and audio that would play more than
+     *  100 ms late is dropped, so sound can't fall behind or hold up the video. During a call (phone mic
+     *  in use) it plays as call audio, so the phone's echo canceller hears it. */
+    private class AudioOut private constructor(private val track: AudioTrack, val call: Boolean) {
+        private var written = 0 // frames; wraps like playbackHeadPosition, so the difference stays right
+
+        fun write(buf: ByteArray, len: Int) {
+            val queued = written - track.playbackHeadPosition
+            if (queued > MAX_QUEUED) return // behind (Wi-Fi burst, clock drift): catch up
+            // About to run dry (the laptop sends nothing while the sink is silent): a cushion for Wi-Fi jitter.
+            if (queued < 5 * 48) written += maxOf(0, track.write(PAD, 0, PAD.size, AudioTrack.WRITE_NON_BLOCKING)) / 4
+            written += maxOf(0, track.write(buf, 0, len and 3.inv(), AudioTrack.WRITE_NON_BLOCKING)) / 4
+        }
+
+        fun release() {
+            runCatching { track.pause(); track.flush() }
+            track.release()
+        }
+
+        companion object {
+            private const val BYTES_PER_MS = 48 * 4
+            // Android 12+: start after 40 ms and drop beyond 100 ms. Android 11 starts a track only once its
+            // whole buffer is full, so there the buffer is small and full writes are what drops.
+            private val MAX_QUEUED = if (Build.VERSION.SDK_INT >= 31) 100 * 48 else Int.MAX_VALUE
+            private val PAD = ByteArray(40 * BYTES_PER_MS)
+
+            fun create(call: Boolean): AudioOut? {
+                val track = runCatching {
+                    AudioTrack.Builder()
+                        .setAudioAttributes(AudioAttributes.Builder()
+                            .setUsage(if (call) AudioAttributes.USAGE_VOICE_COMMUNICATION else AudioAttributes.USAGE_MEDIA)
+                            .setContentType(if (call) AudioAttributes.CONTENT_TYPE_SPEECH else AudioAttributes.CONTENT_TYPE_MUSIC)
+                            .build())
+                        .setAudioFormat(AudioFormat.Builder().setSampleRate(48000).setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                            .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO).build())
+                        .setBufferSizeInBytes(maxOf(AudioTrack.getMinBufferSize(48000, AudioFormat.CHANNEL_OUT_STEREO,
+                            AudioFormat.ENCODING_PCM_16BIT), (if (Build.VERSION.SDK_INT >= 31) 200 else 80) * BYTES_PER_MS))
+                        .setTransferMode(AudioTrack.MODE_STREAM)
+                        .build()
+                }.getOrNull() ?: return null
+                return try {
+                    if (Build.VERSION.SDK_INT >= 31) track.setStartThresholdInFrames(40 * 48)
+                    track.play()
+                    AudioOut(track, call)
+                } catch (e: Exception) {
+                    track.release()
+                    null
+                }
+            }
+        }
+    }
+
+    /** The phone's mic, sent to the laptop while an app there listens. Call mode: echo cancelling voice
+     *  input, sound routed to a headset if one is plugged in, else the loudspeaker. */
+    private inner class MicIn {
+        @Volatile private var running = true
+        @Volatile var active = false // recording, in call mode
+            private set
+        private val am = getSystemService(AudioManager::class.java)
+        private val worker = thread(name = "mic", isDaemon = true) {
+            synchronized(MIC_LOCK) { if (running) record() } // an old mic thread finishes its cleanup first
+        }
+
+        private fun record() {
+            var rec: AudioRecord? = null
+            var aec: AcousticEchoCanceler? = null
+            var ns: NoiseSuppressor? = null
+            try {
+                am.mode = AudioManager.MODE_IN_COMMUNICATION
+                route(true)
+                val min = AudioRecord.getMinBufferSize(48000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+                rec = AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION, 48000, AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT, maxOf(min, MIC_CHUNK * 4))
+                if (rec.state != AudioRecord.STATE_INITIALIZED) return
+                if (AcousticEchoCanceler.isAvailable())
+                    aec = AcousticEchoCanceler.create(rec.audioSessionId)?.apply { enabled = true }
+                if (NoiseSuppressor.isAvailable()) ns = NoiseSuppressor.create(rec.audioSessionId)?.apply { enabled = true }
+                rec.startRecording()
+                active = true
+                val head = msg(C_MIC, 0, MIC_CHUNK ushr 16, MIC_CHUNK and 0xffff)
+                while (running && streaming) {
+                    val buf = ByteArray(MIC_CHUNK)
+                    var off = 0
+                    while (off < MIC_CHUNK && running) {
+                        val n = rec.read(buf, off, MIC_CHUNK - off)
+                        if (n <= 0) return
+                        off += n
+                    }
+                    if (micQueued.get() < 4) { // link busy: drop, don't fall behind or hold up touches
+                        micQueued.incrementAndGet()
+                        touchQueue.offer(head + buf)
+                    }
+                }
+            } catch (e: Exception) {
+                // permission revoked, mic busy: no mic, the session goes on
+            } finally {
+                active = false
+                rec?.let { runCatching { it.stop() }; it.release() }
+                aec?.release()
+                ns?.release()
+                runCatching { route(false) }
+                runCatching { am.mode = AudioManager.MODE_NORMAL }
+            }
+        }
+
+        private fun route(on: Boolean) {
+            if (Build.VERSION.SDK_INT >= 31) {
+                if (!on) return am.clearCommunicationDevice()
+                val devices = am.availableCommunicationDevices
+                val order = listOf(AudioDeviceInfo.TYPE_WIRED_HEADSET, AudioDeviceInfo.TYPE_USB_HEADSET,
+                    AudioDeviceInfo.TYPE_BLE_HEADSET, AudioDeviceInfo.TYPE_BLUETOOTH_SCO, AudioDeviceInfo.TYPE_BUILTIN_SPEAKER)
+                order.firstNotNullOfOrNull { t -> devices.firstOrNull { it.type == t } }?.let { am.setCommunicationDevice(it) }
+            } else {
+                @Suppress("DEPRECATION")
+                am.isSpeakerphoneOn = on && !am.isWiredHeadsetOn
+            }
+        }
+
+        fun stop() {
+            running = false
+            worker.join(500)
+        }
+    }
 
     private class Decoder(surface: Surface, w: Int, h: Int, mime: String) {
         private val codec = MediaCodec.createDecoderByType(mime)
@@ -1537,6 +1718,14 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         private const val FLAG_INFO = 4
         private const val FLAG_BYE = 8
         private const val FLAG_CLIP = 16
+        private const val FLAG_AUDIO = 32
+        private const val FLAG_MIC = 64
+        private const val F_AUDIO = 16
+        private const val F_MIC = 32
+        private const val C_MIC = 51
+        private const val MIC_CHUNK = 1920 // 20 ms of 48 kHz mono s16
+        private const val REQ_MIC = 7
+        private val MIC_LOCK = Any()
         private const val C_CLIP = 50
         private const val F_CLIP = 8
         private const val H_CLIP = 4

@@ -1,0 +1,3 @@
+* Laptop audio on the phone: Settings → Laptop audio. The laptop gets a "Hypr Screen (phone)" sound output; apps you move to it play on the phone
+* Phone mic for calls: Settings → Phone mic. The laptop gets a "Hypr Screen (phone) mic" input; the phone records only while an app uses it, with echo cancelling
+* Needs Hypr Screen 0.7.0 on the laptop

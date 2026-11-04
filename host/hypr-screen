@@ -24,6 +24,7 @@ Settings: ~/.config/hypr-screen/config.json
 """
 import argparse
 import base64
+import collections
 import fcntl
 import hashlib
 import hmac
@@ -43,7 +44,7 @@ import tempfile
 import threading
 import time
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 PORT = 7878
 OUTPUT = "HYPRSCREEN"
 PACKAGE = "com.hyprscreen"
@@ -52,10 +53,14 @@ PROTO = "3"
 FLAG_CONFIG, FLAG_KEY, FLAG_INFO = 1, 2, 4  # INFO: "<w> <h> <codec> <host features>" before each new stream
 FLAG_BYE = 8  # the laptop ended the session on purpose: don't reconnect (sent to 0.5.0+ phones)
 FLAG_CLIP = 16  # payload: the laptop's clipboard text (UTF-8), only to phones that sent F_CLIP (0.6.0+)
+FLAG_AUDIO = 32  # payload: PCM s16le 48 kHz stereo from the Hypr Screen sink, only to phones that sent F_AUDIO (0.7.0+)
+FLAG_MIC = 64  # payload: 1 byte, 1 = an app is listening to the phone mic (start sending C_MIC), 0 = stop (0.7.0+)
 KICK_SECONDS = 25  # after --disconnect, refuse that phone this long (older phones retry for 20 s)
 H_PEN, H_TRACKPAD = 1, 2  # host features in INFO (0.4.0+): phones fall back to plain touch without them
 H_CLIP = 4  # host feature (0.6.0+): clipboard sharing is on, the phone may send C_CLIP
 H_POINTER = 8  # host feature (0.6.0+): understands A_POS (touch works as a mouse)
+H_AUDIO = 16  # host feature (0.7.0+): the Hypr Screen sink is up, AUDIO frames may follow
+H_MIC = 32  # host feature (0.7.0+): the phone mic source is up, MIC frames say when to send C_MIC
 CLIP_MAX = 256 * 1024  # larger clipboard texts are not shared
 LINGER_SECONDS = 15  # keep a Wi-Fi phone's monitor this long while it reconnects
 START = b"\x00\x00\x00\x01"
@@ -83,6 +88,8 @@ DEFAULTS = {
     "mirror_output": "",  # mirror mode: monitor to show ("" = the one you are using)
     "phones": {},  # per phone (id from --devices, or "usb"): {"position": ..., "workspaces": [...]}
     "clipboard": True,  # share clipboard text with phones that turn it on (needs wl-clipboard)
+    "audio": True,  # offer a "Hypr Screen (phone)" sound output to phones that turn audio on (needs pactl, parec)
+    "mic": True,  # offer a "Hypr Screen (phone) mic" input to phones that turn the mic on (needs pw-cat, pactl)
 }
 
 
@@ -404,8 +411,13 @@ K_TAP, K_CHAR, K_RAW = 10, 11, 14
 C_VIEW, C_PREF, C_HELLO, C_BYE = 20, 21, 22, 23  # VIEW: x=w y=h; PREF: slot=key x=value; HELLO: x=features
 F_INFO, F_HEVC, F_BYE = 1, 2, 4  # phone features: understands INFO frames; can decode HEVC; BYE frames
 F_CLIP = 8  # phone feature (0.6.0+): wants clipboard sharing (CLIP frames)
+F_AUDIO = 16  # phone feature (0.7.0+): plays AUDIO frames
+F_MIC = 32  # phone feature (0.7.0+): can send its mic (C_MIC) when asked with MIC frames
 # Clipboard (0.6.0): x << 16 | y = length, then that many bytes of UTF-8 text. Only sent to laptops with H_CLIP.
 C_CLIP = 50
+# Mic (0.7.0): same framing as C_CLIP, PCM s16le 48 kHz mono. Only sent after a MIC frame said 1.
+C_MIC = 51
+MIC_MAX = 16384
 P_FPS, P_SCALE, P_CODEC, P_RES, P_MODE = 1, 2, 3, 4, 5  # P_MODE: 0 extend, 1 mirror  # PREF keys: fps; scale*100 (0 = laptop default); 1 = H.264 only; resolution %
 # Stylus (0.4.0): AUX carries x=pressure 0..65535, y=(tilt_x+90) | (tilt_y+90) << 8; POS slot = PEN_* flags.
 S_AUX, S_POS = 30, 31
@@ -918,6 +930,9 @@ class Session:
         self.w, self.h = w, h
         self.features = 0
         self.clip = None  # ClipSync while clipboard sharing is on
+        self.audio = None  # AudioCapture while audio goes to the phone
+        self.mic = None  # MicSource while the phone's mic is offered to apps
+        self.mic_on = False  # what the last MIC frame told the phone
         self.fps = int(cfg["fps"])
         self.scale_pref = 0  # 0 = laptop default
         self.res = 100
@@ -1158,6 +1173,166 @@ class ClipSync:
             self.proc.kill()
 
 
+SINK = "hypr_screen"
+SINK_DESC = "Hypr Screen (phone)"
+
+
+def find_sink_modules():
+    out = run("pactl", "list", "short", "modules", check=False, timeout=5) if shutil.which("pactl") else ""
+    return [line.split()[0] for line in out.splitlines() if re.search(rf"\bsink_name={SINK}(\s|$)", line)]
+
+
+def ensure_sink():
+    """The opt-in sound output: apps the user moves to it (pavucontrol, ...) play on the phone."""
+    if not find_sink_modules():
+        run("pactl", "load-module", "module-null-sink", f"sink_name={SINK}",
+            f"sink_properties=\"device.description='{SINK_DESC}'\"", timeout=5)
+
+
+def remove_sink():
+    """Apps on the sink move back to the default output (WirePlumber moves them back when it returns)."""
+    for mod in find_sink_modules():
+        run("pactl", "unload-module", mod, check=False, timeout=5)
+
+
+class AudioCapture:
+    """parec on the sink's monitor -> 20 ms PCM chunks, newest few only: audio never holds up video."""
+
+    CHUNK = 48000 * 4 // 50  # 20 ms of s16le stereo
+    SILENT = bytes(CHUNK)
+
+    @classmethod
+    def start(cls):
+        if not (shutil.which("pactl") and shutil.which("parec")):
+            log("audio to the phone needs pactl and parec (libpulse / pipewire-pulse)")
+            return None
+        try:
+            ensure_sink()
+            return cls()
+        except (OSError, RuntimeError, subprocess.SubprocessError) as e:
+            log(f"audio to the phone unavailable: {e}")
+            return None
+
+    def __init__(self):
+        self.chunks = collections.deque(maxlen=5)  # 100 ms: older audio is dropped, not delayed
+        self.stopping = False
+        self.retry_at = 0.0
+        self.respawning = False
+        self.spawn()
+
+    def spawn(self):
+        self.proc = subprocess.Popen(["parec", f"--device={SINK}.monitor", "--format=s16le", "--rate=48000",
+                                      "--channels=2", "--latency-msec=20", "--raw"],
+                                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        threading.Thread(target=self.read, args=(self.proc,), daemon=True).start()
+
+    def read(self, proc):
+        while True:
+            chunk = proc.stdout.read(self.CHUNK)
+            if len(chunk) < self.CHUNK:
+                break
+            if chunk != self.SILENT:  # an idle sink streams zeros: don't send them
+                self.chunks.append(chunk)
+        if not self.stopping:
+            log(f"audio: parec exited ({proc.wait()}), restarting it")
+
+    def take(self):
+        if (self.proc.poll() is not None and not self.stopping and not self.respawning
+                and time.monotonic() > self.retry_at):
+            self.retry_at = time.monotonic() + 2  # e.g. pipewire-pulse restarted: bring the sink back
+            self.respawning = True
+            threading.Thread(target=self.respawn, daemon=True).start()  # pactl may hang: not on the pump
+        try:
+            return self.chunks.popleft()
+        except IndexError:
+            return None
+
+    def respawn(self):
+        try:
+            ensure_sink()
+            if not self.stopping:
+                self.spawn()
+        except (OSError, RuntimeError, subprocess.SubprocessError) as e:
+            log(f"audio: {e}")
+        finally:
+            self.respawning = False
+
+    def stop(self):
+        self.stopping = True
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+
+
+MIC_NODE = "hypr_screen_mic"
+MIC_DESC = "Hypr Screen (phone) mic"
+
+
+class MicSource:
+    """The phone's mic as a laptop input: a pw-cat stream that is itself an Audio/Source node.
+    Gaps in what the phone sends come out as silence; the phone only records while an app listens."""
+
+    @classmethod
+    def start(cls):
+        if not (shutil.which("pw-cat") and shutil.which("pactl")):
+            log("the phone mic needs pw-cat (pipewire) and pactl")
+            return None
+        try:
+            return cls()
+        except OSError as e:
+            log(f"phone mic unavailable: {e}")
+            return None
+
+    def __init__(self):
+        self.stopping = False
+        self.in_use = False
+        self.proc = subprocess.Popen(["pw-cat", "--playback", "--raw", "--format=s16", "--rate=48000", "--channels=1",
+                                      "--latency=20ms", "-P", f'{{ media.class=Audio/Source node.name={MIC_NODE} '
+                                      f'node.description="{MIC_DESC}" }}', "-"],
+                                     stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.fd = self.proc.stdin.fileno()
+        try:  # a small pipe: at most ~170 ms of mic waits here, the rest is dropped
+            fcntl.fcntl(self.fd, fcntl.F_SETPIPE_SZ, 16384)
+        except (OSError, AttributeError):
+            pass
+        os.set_blocking(self.fd, False)
+        threading.Thread(target=self.watch, daemon=True).start()
+
+    def watch(self):
+        """Is an app recording from the source? (pactl shows the node RUNNING while one is.)"""
+        while not self.stopping and self.proc.poll() is None:
+            try:
+                out = run("pactl", "list", "short", "sources", check=False, timeout=5)
+                self.in_use = any(f[1:2] == [MIC_NODE] and f[-1] == "RUNNING"
+                                  for f in (line.split("\t") for line in out.splitlines()))
+            except (OSError, subprocess.SubprocessError):
+                self.in_use = False  # pipewire-pulse restarting: don't keep the phone recording
+            time.sleep(0.5)
+        self.in_use = False
+        if not self.stopping:
+            log(f"phone mic: pw-cat exited ({self.proc.wait()})")
+
+    def write(self, pcm):
+        try:
+            os.write(self.fd, pcm[:len(pcm) & ~1])  # under PIPE_BUF: written whole or not at all
+        except OSError:  # full (dropped) or pw-cat gone
+            pass
+
+    def stop(self):
+        self.stopping = True
+        try:
+            self.proc.stdin.close()
+        except OSError:
+            pass
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+
+
 class Pipeline:
     """Monitor mode + wf-recorder + FLV reader for the session's current settings."""
 
@@ -1179,7 +1354,7 @@ class Pipeline:
         self.frames = queue.Queue(maxsize=8)
         self.encoder, self.codec = s.choose()
         if s.features & F_INFO:  # tell the phone what is coming before the first config frame
-            info = f"{s.w} {s.h} {self.codec} {H_PEN | H_TRACKPAD | H_POINTER | (H_CLIP if s.clip else 0)}".encode()
+            info = f"{s.w} {s.h} {self.codec} {H_PEN | H_TRACKPAD | H_POINTER | (H_CLIP if s.clip else 0) | (H_AUDIO if s.audio else 0) | (H_MIC if s.mic else 0)}".encode()
             sock.settimeout(10)
             sock.sendall(struct.pack(">IBI", len(info), FLAG_INFO, 0) + info)
         with open(os.path.join(self.tmp, "wf-recorder.log"), "w") as errlog:
@@ -1340,6 +1515,7 @@ class Daemon:
         self.pair_lock = threading.Lock()  # one pairing request at a time
         self.linger_lock = threading.Lock()
         self.linger_token = None  # set while a disconnected Wi-Fi phone's monitor is kept
+        self.kept_mic = None  # and its mic input, so calls don't move to the laptop mic
         self.pair_quiet_until = 0.0
         self.active = None  # the connected phone: device, name, via, since, conn, session
         self.last_device = None  # device of the most recent session (for a kick while its monitor lingers)
@@ -1403,6 +1579,8 @@ class Daemon:
                 self.linger_token = None
             self.kicked_until[dev] = time.monotonic() + KICK_SECONDS
             quietly(remove_monitor)
+            quietly(remove_sink)
+            self.drop_kept_mic()
             return True
         if device is not None and a["device"] != device:
             return False
@@ -1686,6 +1864,15 @@ class Daemon:
                 log(f"touch/keyboard input unavailable: {e}")
             if sess.features & F_CLIP and self.cfg.get("clipboard", True):
                 sess.clip = ClipSync.start()
+            if sess.features & F_AUDIO and self.cfg.get("audio", True):
+                sess.audio = AudioCapture.start()
+            elif self.linger_token is None:
+                quietly(remove_sink)  # kept for a phone that dropped, not wanted by this one
+            kept, self.kept_mic = self.kept_mic, None  # from a Wi-Fi phone that dropped: calls stay on it
+            if sess.features & F_MIC and self.cfg.get("mic", True):
+                sess.mic = kept if kept and kept.proc.poll() is None else MicSource.start()
+            if kept and kept is not sess.mic:
+                quietly(kept.stop)
             pipe = Pipeline(self.cfg, sess)
             pipe.start(sock)
             if workspaces and not sess.mirror:
@@ -1696,6 +1883,8 @@ class Daemon:
             self.active = None
             if sess.clip:
                 quietly(sess.clip.stop)
+            if sess.audio:
+                quietly(sess.audio.stop)
             if pipe:
                 pipe.stop()
             for dev in ("touch", "pen", "mouse", "pointer"):
@@ -1706,10 +1895,17 @@ class Daemon:
                 quietly(keyboard.close)
             # Linger only for a working Wi-Fi session that dropped (not Back, not our own failure).
             linger = have_monitor and sess.sent and via != "USB" and not bye and not sess.kicked
+            if sess.mic:
+                if linger:
+                    self.kept_mic = sess.mic
+                else:
+                    quietly(sess.mic.stop)
             if linger:
                 self.linger_monitor()  # give the phone a moment to come back
             elif have_monitor:
                 quietly(remove_monitor)
+            if not linger and self.linger_token is None:  # not while another phone's monitor is kept
+                quietly(remove_sink)
             log("display session ended" + (f" (monitor kept {LINGER_SECONDS}s)" if linger else ""))
             notify("Phone display disconnected")
 
@@ -1724,9 +1920,16 @@ class Daemon:
                     return  # reclaimed by a new session
                 self.linger_token = None
                 quietly(remove_monitor)
+                quietly(remove_sink)
+                self.drop_kept_mic()
         t = threading.Timer(LINGER_SECONDS, expire)
         t.daemon = True
         t.start()
+
+    def drop_kept_mic(self):
+        kept, self.kept_mic = self.kept_mic, None
+        if kept:
+            quietly(kept.stop)
 
     def reclaim_monitor(self):
         """True if a lingering monitor was taken over (windows stay where they were)."""
@@ -1766,6 +1969,18 @@ class Daemon:
             if clip is not None:
                 sock.settimeout(10)
                 sock.sendall(struct.pack(">IBI", len(clip), FLAG_CLIP, 0) + clip)
+            while sess.audio:
+                pcm = sess.audio.take()
+                if pcm is None:
+                    break
+                sock.settimeout(10)
+                t0 = time.monotonic()
+                sock.sendall(struct.pack(">IBI", len(pcm), FLAG_AUDIO, 0) + pcm)
+                sess.count_busy(t0, time.monotonic())
+            if sess.mic and sess.mic.in_use != sess.mic_on:
+                sess.mic_on = sess.mic.in_use
+                sock.settimeout(10)
+                sock.sendall(struct.pack(">IBIB", 1, FLAG_MIC, 0, int(sess.mic_on)))
             sock.settimeout(0)
             while True:  # drain everything the phone has sent
                 try:
@@ -1789,6 +2004,16 @@ class Daemon:
                         break
                     if sess.clip:
                         sess.clip.set(buf[off + MSG.size:off + MSG.size + size])
+                    off += MSG.size + size
+                    continue
+                if kind == C_MIC:
+                    size = msg[2] << 16 | msg[3]
+                    if size > MIC_MAX:
+                        raise RuntimeError("mic message too large")
+                    if len(buf) - off - MSG.size < size:
+                        break
+                    if sess.mic:
+                        sess.mic.write(buf[off + MSG.size:off + MSG.size + size])
                     off += MSG.size + size
                     continue
                 off += MSG.size
@@ -2044,8 +2269,9 @@ def main():
 
     cfg = load_config()
     d = Daemon(cfg, load_identity())
-    remove_monitor()  # leftover from a crash
-    signal.signal(signal.SIGTERM, lambda *_: (remove_monitor(), os._exit(0)))
+    remove_monitor()  # leftovers from a crash
+    quietly(remove_sink)
+    signal.signal(signal.SIGTERM, lambda *_: (remove_monitor(), quietly(remove_sink), os._exit(0)))
     threading.Thread(target=d.control_server, daemon=True).start()
     if cfg["wifi"]:
         threading.Thread(target=d.discovery, daemon=True).start()
@@ -2055,6 +2281,7 @@ def main():
         d.serve()
     except KeyboardInterrupt:
         remove_monitor()
+        quietly(remove_sink)
 
 
 if __name__ == "__main__":
