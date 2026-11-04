@@ -5,7 +5,7 @@
   "version": "0.8.0",
   "author": "kpanuragh",
   "license": "MIT",
-  "description": "Turn your Android phone into a Hyprland monitor, and run it from the bar: connection, paired phones, clipboard, sound and mic in one click.",
+  "description": "Sidecar-style second screen for Omarchy: extend your desktop onto your Android phone over USB or Wi-Fi, and control it all from the bar.",
   "homepage": "https://github.com/kpanuragh/hypr-screen",
   "kinds": [
     "bar-widget"
@@ -15,7 +15,7 @@
   },
   "barWidget": {
     "displayName": "Hypr Screen",
-    "description": "Your phone as a second screen, one click away: see or end the connection, send windows and app sound to the phone, forget paired phones, and switch clipboard, sound and mic (synced with the phone app).",
+    "description": "Extend your desktop onto your phone, Sidecar-style. One click to see the connection, send windows and app sound to the phone, manage paired phones, and switch clipboard, sound and mic.",
     "category": "System",
     "allowMultiple": false,
     "defaultSection": "right",
