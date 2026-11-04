@@ -29,8 +29,9 @@ Plug the phone in over USB and it becomes a real Hyprland output next to your la
   - Three-finger tap for middle-click; three-finger swipe to switch workspace.
 - **Touch as mouse.** For apps that ignore touch (kitty and other terminals), set **Touch input → Mouse** on the phone: tap to click, drag to select text, long-press or two-finger tap to right-click, two fingers to scroll.
 - **Shared clipboard.** Text copied on the laptop can be pasted on the phone, and text copied on the phone reaches the laptop when you switch back to Hypr Screen (or tap 📋 on the key row). Passwords marked sensitive by a password manager are never shared. Turn it off with **Shared clipboard → Off** on the phone. Needs `wl-clipboard` on the laptop.
-- **Laptop audio on the phone.** Turn on **Laptop audio → Play on the phone** and, while the phone is connected, the laptop gets an extra sound output called **Hypr Screen (phone)**. Move an app to it (pavucontrol, or `pactl move-sink-input`) and its sound plays on the phone; everything else stays on the laptop. WirePlumber remembers the choice for next time. Off by default. Needs `pactl` and `parec` (pipewire-pulse/libpulse).
+- **Laptop audio on the phone.** Turn on **Laptop audio → Play on the phone** and, while the phone is connected, the laptop gets an extra sound output called **Hypr Screen (phone)**. Send an app to it (from the Omarchy bar widget, pavucontrol, or `pactl move-sink-input`) and its sound plays on the phone; everything else stays on the laptop. WirePlumber remembers the choice for next time. Off by default. Needs `pactl` and `parec` (pipewire-pulse/libpulse).
 - **Phone mic for calls.** Turn on **Phone mic** (it asks for the microphone permission once) and the laptop gets an input called **Hypr Screen (phone) mic**. Pick it in Meet, Zoom, Discord and so on. The phone records only while an app on the laptop is listening, using Android's call mode with echo cancelling; during that time laptop sound on the phone plays as call audio, through a plugged-in headset if there is one, else the loudspeaker. Anything that opens the input counts as listening, including level meters such as pavucontrol's Input Devices tab, so don't make it your default input unless you want the phone mic always on. Off by default. Needs `pw-cat` (pipewire).
+- **Settings in step.** Clipboard, laptop sound and phone mic switch at once, from the phone app or the laptop, and the two sides stay in sync.
 - **Keyboard.** Type with the phone keyboard; the picture shrinks to stay visible above it. An extra key row gives `Esc Tab Ctrl Alt Super ← ↑ ↓ → 📋`, and the modifiers are sticky, so Super then 1 switches workspace. A Bluetooth keyboard paired to the phone is passed straight through.
 
 ## Requirements
@@ -40,7 +41,7 @@ Plug the phone in over USB and it becomes a real Hyprland output next to your la
 - `wf-recorder`, `android-tools` (adb), `openssl`, Python 3 (standard library only)
 - A GPU for hardware encoding: VAAPI (Intel, AMD) or NVENC (NVIDIA, proprietary driver). Intel is tested. The encoder is picked automatically: the configured one (`"encoder"`) is tried first, and if it fails to start, the others follow (VAAPI → NVENC → software x264).
 - Write access to `/dev/uinput` for touch and keyboard. Desktop sessions usually get this through logind. Check with `getfacl /dev/uinput`.
-- Optional: `wl-clipboard`, for the shared clipboard; `wtype`, for typing characters outside the US layout.
+- Optional: `wl-clipboard`, for the shared clipboard; `pactl` and `parec` (pipewire-pulse), for laptop sound on the phone; `pw-cat` (pipewire), for the phone mic; `wtype`, for typing characters outside the US layout.
 
 **Phone**
 - Android 11+ with **USB debugging** enabled (Developer options).
@@ -62,7 +63,7 @@ mise use -g github:kpanuragh/hypr-screen
 hypr-screen --install-service
 ```
 
-mise waits 24 hours before offering a new release (its `minimum_release_age` setting). To install a release on its first day, pin it, for example `github:kpanuragh/hypr-screen@0.2.0`.
+mise waits 24 hours before offering a new release (its `minimum_release_age` setting). To install a release on its first day, pin it, for example `github:kpanuragh/hypr-screen@0.8.0`.
 
 Or from a git checkout:
 
@@ -73,6 +74,8 @@ cd hypr-screen/host
 ```
 
 Either way, this starts the `hypr-screen` systemd user service, which comes up with your graphical session. Run `hypr-screen --uninstall-service` to remove it.
+
+On **Omarchy**, `install.sh` also adds the bar widget; with mise, run `hypr-screen --install-omarchy` (see [Omarchy bar](#4-laptop-shortcuts-and-bar-widget)).
 
 ### 2. Phone
 
@@ -95,7 +98,7 @@ Release APKs are signed with this certificate (SHA-256):
   ```
   Open the app on the same network and tap **Pair** next to your laptop. The phone shows a 6-digit code and a window opens on the laptop: type the code there, press **Enter**, then tap **Confirm** on the phone. After that, tap **Connect** whenever you want the extra monitor.
 
-  Manage Wi-Fi-paired phones with `hypr-screen --devices` and `hypr-screen --forget <id>` (this also ends its session if it is connected). On the phone, **Paired laptops** in the settings lists your laptops, with **Forget**.
+  Manage Wi-Fi-paired phones in the Omarchy bar widget, or with `hypr-screen --devices` and `hypr-screen --forget <id>` (this also ends its session if it is connected). On the phone, **Paired laptops** in the settings lists your laptops, with **Forget**.
 
 On the phone, the **⌨** button opens the keyboard (drag it to move it). **Back** closes the keyboard; pressing Back again disconnects.
 
@@ -123,7 +126,7 @@ o.bind("SUPER + SHIFT + P", "Move window to phone", "hypr-screen --move-window")
 - while the phone plays laptop sound, choose which apps play on it;
 - start or stop the service.
 
-To hide the icon while idle, set `"hideWhenIdle": true` on its entry in `bar.layout` of `~/.config/omarchy/shell.json`. Remove it with `omarchy plugin remove kpanuragh.hypr-screen`. On other desktops nothing is installed; use Waybar below. The widget uses these commands, which are handy in scripts too:
+To hide the icon while idle, set `"hideWhenIdle": true` on its entry in `bar.layout` of `~/.config/omarchy/shell.json`. The widget is also published on its own as [omarchy-hypr-screen](https://github.com/kpanuragh/omarchy-hypr-screen) (`omarchy plugin add https://github.com/kpanuragh/omarchy-hypr-screen --enable`); use one install or the other. Remove it with `omarchy plugin remove kpanuragh.hypr-screen`. On other desktops nothing is installed; use Waybar below. The widget uses these commands, which are handy in scripts too:
 
 ```sh
 hypr-screen --state                 # service, connected phone, paired phones, settings (JSON)
@@ -165,9 +168,9 @@ The widget shows a phone icon while a phone is connected (class `connected` or `
 | `clipboard` | `true` | Share clipboard text with phones that turn it on (needs `wl-clipboard`) |
 | `audio` | `true` | Offer the Hypr Screen (phone) sound output to phones that turn audio on |
 | `mic` | `true` | Offer the Hypr Screen (phone) mic input to phones that turn the mic on |
+| `phones` | `{}` | Per-phone `position` and `workspaces`, keyed by the id from `--devices` (or `"usb"`) |
 
 `clipboard`, `audio` and `mic` are kept in step with the phone app (0.8.0 on both sides): when a phone connects, the laptop takes the app's three settings, and switching one on the laptop while it is connected (`hypr-screen --set`, or the Omarchy bar widget) also switches it in the app. They apply at once, without reconnecting.
-| `phones` | `{}` | Per-phone `position` and `workspaces`, keyed by the id from `--devices` (or `"usb"`) |
 
 Example for a phone that sits below the laptop screen and gets workspace 9:
 
@@ -192,6 +195,7 @@ Hyprland ── headless output "HYPRSCREEN" ── wf-recorder (H.264/HEVC via 
 
 - **USB** uses `adb reverse`, so the phone connects to `127.0.0.1:7878` and the traffic never touches the network.
 - **Wi-Fi** discovery is a UDP broadcast on port 7878.
+- **Clipboard, laptop sound and the phone mic** travel over the same encrypted connection as the video. Laptop sound comes from a PipeWire null sink (`hypr_screen`); the phone mic is a PipeWire source (`hypr_screen_mic`).
 
 ### Security
 
