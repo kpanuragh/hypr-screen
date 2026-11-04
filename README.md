@@ -89,7 +89,7 @@ Release APKs are signed with this certificate (SHA-256):
 ### 3. Connect
 
 - **USB:** plug the phone in and accept the USB debugging prompt. The app opens and the phone becomes the monitor to the right of your screen.
-- **Wi-Fi:** off by default. Set `"wifi": true` in the config and restart the service. If you use `ufw`, allow only your local network, for example:
+- **Wi-Fi:** off by default. Turn it on with `hypr-screen --set wifi on` (or the Wi-Fi toggle in the Omarchy bar widget), which restarts the service. If you use `ufw`, allow only your local network, for example:
   ```sh
   sudo ufw allow from 192.168.1.0/24 to any port 7878
   ```

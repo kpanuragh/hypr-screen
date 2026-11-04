@@ -2317,8 +2317,7 @@ def install_service():
         subprocess.run(["systemctl", "--user", *cmd], check=True)
     print(f"hypr-screen service installed and running ({exe}).\n")
     print("USB: plug in your phone (USB debugging on) with the Hypr Screen app installed.")
-    print('Wi-Fi: set "wifi": true in ~/.config/hypr-screen/config.json, run')
-    print("  systemctl --user restart hypr-screen")
+    print("Wi-Fi: run  hypr-screen --set wifi on  (or use the Omarchy bar widget)")
     print("and, with ufw, allow your LAN only, e.g.: sudo ufw allow from 192.168.1.0/24 to any port 7878")
     print("Then tap Pair in the phone app and type the code it shows into the window on the laptop.")
 
@@ -2473,6 +2472,10 @@ def install_omarchy():
     src = omarchy_plugin_source()
     if not src:
         sys.exit("plugin files not found (the omarchy/ folder of the release or git checkout)")
+    if os.path.isdir(os.path.join(PLUGIN_DIR, ".git")):  # from the marketplace / `omarchy plugin add`
+        print(f"The bar widget is already installed from git ({PLUGIN_DIR}); leaving it as it is.")
+        print(f"Update it with: omarchy plugin update {PLUGIN_ID}")
+        return
     exe = service_exe()
     os.makedirs(os.path.join(PLUGIN_DIR, "bin"), exist_ok=True)
     for name in os.listdir(src):
