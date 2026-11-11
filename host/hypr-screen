@@ -1430,13 +1430,18 @@ TERMINALS = (  # (binary, args before the command)
     ("foot", ["--app-id", PAIR_CLASS, "--title", "Hypr Screen pairing"]),
     ("alacritty", ["--class", PAIR_CLASS, "--title", "Hypr Screen pairing", "-e"]),
     ("ghostty", [f"--class={PAIR_CLASS}", "--title=Hypr Screen pairing", "-e"]),
+    ("wezterm", ["start", "--class", PAIR_CLASS, "--"]),
 )
 
 
 def launch_prompt(result_path, name, addr, code):
     """Open a small floating terminal asking the user to accept the phone. False if none could start."""
-    run("hyprctl", "eval", f'hl.window_rule({{ match = {{ class = "{PAIR_CLASS}" }}, float = true, '
-        f'center = true, pin = true, size = {{ 620, 330 }} }})', check=False)
+    lua = (f'hl.window_rule({{ match = {{ class = "{PAIR_CLASS}" }}, float = true, '
+           f'center = true, pin = true, size = {{ 620, 330 }} }})')
+    if run("hyprctl", "eval", lua, check=False).strip() != "ok":  # hyprland.conf: try both rule syntaxes
+        rules = [f"{r}, match:class ^({PAIR_CLASS})$" for r in ("float on", "center on", "pin on", "size 620 330")]
+        rules += [f"{r}, class:^({PAIR_CLASS})$" for r in ("float", "center", "pin", "size 620 330")]  # before 0.53
+        run("hyprctl", "--batch", " ; ".join(f"keyword windowrule {r}" for r in rules), check=False)
     cmd = [sys.executable, os.path.abspath(__file__), "--confirm-pair", result_path, name, addr, code]
     for exe, flags in TERMINALS:
         if shutil.which(exe):
