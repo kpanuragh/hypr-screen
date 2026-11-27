@@ -2494,6 +2494,17 @@ def install_omarchy():
     if omarchy_bar_has_plugin():  # an update: keep it where the user put it
         print(f"Hypr Screen bar widget updated ({PLUGIN_DIR}).")
         return
+    # rescanPlugins reloads asynchronously: wait briefly until omarchy-shell indexes the plugin.
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        try:
+            listed = subprocess.run(["omarchy-shell", "shell", "listPlugins"],
+                                    capture_output=True, text=True, timeout=5)
+            if listed.returncode == 0 and f'"{PLUGIN_ID}"' in listed.stdout:
+                break
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        time.sleep(0.25)
     r = subprocess.run(["omarchy", "plugin", "enable", PLUGIN_ID, "--section", "right"],
                        capture_output=True, text=True, timeout=30)
     if r.returncode:
