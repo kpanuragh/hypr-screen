@@ -15,7 +15,7 @@ android {
     compileSdk = 36
     defaultConfig {
         applicationId = "com.hyprscreen"
-        minSdk = 30
+        minSdk = 28
         targetSdk = 36
         versionCode = 9
         versionName = "0.8.0"
