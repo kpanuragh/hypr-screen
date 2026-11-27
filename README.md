@@ -20,7 +20,7 @@ Plug the phone in over USB and it becomes a real Hyprland output next to your la
 - **One tap on the phone.** Opening the app connects to the laptop you used last as soon as it is found on your network. A Quick Settings tile does the same from anywhere.
 - **Bar widget and shortcuts.** Show the connection in Waybar or the Omarchy bar (with a panel for paired phones, settings and app sound), end it from the laptop, and send the focused window to the phone with a key.
 - **Wi-Fi (opt-in).** The app discovers your laptop on the local network. Pair once by tapping **Pair** and accepting on the laptop (like Bluetooth), or just plug in USB once. On a slow network, quality and then frame rate step down automatically and come back when it recovers. If Wi-Fi drops, the phone reconnects by itself, and the laptop keeps its monitor (and your windows on it) for 15 seconds.
-- **Secure by default.** Every connection is TLS 1.3 with a pinned certificate, and the phone must prove it holds its pairing key.
+- **Secure by default.** Every connection is TLS 1.3 (TLS 1.2 on Android 9) with a pinned certificate, and the phone must prove it holds its pairing key.
 - **Multitouch.** A virtual touchscreen is mapped onto the phone's monitor, so you can tap, drag, scroll and pinch.
 - **Stylus.** A pen (S Pen, USI) becomes a drawing tablet with pressure, tilt, eraser, side button and hover. It works in Krita, Xournal++, GIMP and other tablet-aware apps.
 - **Trackpad mode.** Tap the 🖱 button to use the phone like a laptop touchpad for the whole desktop:
@@ -44,7 +44,7 @@ Plug the phone in over USB and it becomes a real Hyprland output next to your la
 - Optional: `wl-clipboard`, for the shared clipboard; `pactl` and `parec` (pipewire-pulse), for laptop sound on the phone; `pw-cat` (pipewire), for the phone mic; `wtype`, for typing characters outside the US layout.
 
 **Phone**
-- Android 11+ with **USB debugging** enabled (Developer options).
+- Android 9+ with **USB debugging** enabled (Developer options).
 
 ## Install
 
@@ -201,7 +201,7 @@ Hyprland ── headless output "HYPRSCREEN" ── wf-recorder (H.264/HEVC via 
 
 - **USB pairing.** When a phone is plugged in, the service uses adb to write a pairing record (host id, secret key, certificate fingerprint) into the app's private storage (`Android/data/com.hyprscreen`), which other apps can't read.
 - **Wi-Fi pairing.** Works like Bluetooth pairing. The phone shows a 6-digit code computed from the laptop's certificate fingerprint and a random value from each side. The phone commits to its value before it sees the laptop's, so a man in the middle can't make the code match. You type the code on the laptop (a stray keypress can't accept a request). The laptop sends a new per-phone secret only after you accept on **both** the laptop and the phone. Requests are refused while Wi-Fi pairing is off, only one can be open at a time, and a rejected request blocks new ones for 10 seconds.
-- **Encryption.** Every connection, USB included, is **TLS 1.3**. The phone pins the laptop's self-signed certificate, so a fake laptop on the network can't impersonate yours, and video and keystrokes can't be read or altered in transit.
+- **Encryption.** Every connection, USB included, is **TLS 1.3** (or **TLS 1.2** with modern AEAD ciphers on Android 9). The phone pins the laptop's self-signed certificate, so a fake laptop on the network can't impersonate yours, and video and keystrokes can't be read or altered in transit.
 - **Authentication.** After TLS, the phone answers a fresh challenge with `HMAC-SHA256(secret, server_nonce | client_nonce)`. Unpaired connections are rejected, including other local processes on the laptop and other apps on the phone.
 - **Input safety.** Power, sleep, suspend and SysRq keys can never be sent from the phone.
 - **Files.** Keys live in `~/.config/hypr-screen/` (`identity.json`, `key.pem`, mode 600). Wi-Fi-paired phones are in `devices.json`; remove one with `hypr-screen --forget <id>`. Delete the files and restart the service to revoke every paired phone. The app disables Android backups of its pairing data.

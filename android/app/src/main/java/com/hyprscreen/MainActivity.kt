@@ -10,6 +10,8 @@ import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
 import android.graphics.Color
+import android.graphics.Point
+import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.Manifest
@@ -85,7 +87,7 @@ import kotlin.concurrent.thread
  * (adb reverse -> 127.0.0.1) or Wi-Fi (UDP discovery), then shows the H.264
  * stream of the Hyprland monitor it creates for us.
  *
- * Everything runs over TLS 1.3; the laptop's certificate is pinned.
+ * Everything runs over TLS 1.3 (TLS 1.2 on Android 9); the laptop's certificate is pinned.
  * Handshake:  laptop: HELLO 3 <id> <hostname> <nonce>
  *             phone:  HYPRSCREEN 3 <w> <h> <dpi> <client nonce> <HMAC proof> [device id]
  *             laptop: OK | DENIED | BUSY
@@ -157,7 +159,13 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private val hevcDecoder: Boolean by lazy {
         runCatching {
             MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.any { c ->
-                !c.isEncoder && c.isHardwareAccelerated &&
+                val hw = if (Build.VERSION.SDK_INT >= 29) {
+                    c.isHardwareAccelerated
+                } else {
+                    !c.name.startsWith("OMX.google.", ignoreCase = true) &&
+                        !c.name.startsWith("c2.android.", ignoreCase = true)
+                }
+                !c.isEncoder && hw &&
                     c.supportedTypes.any { it.equals(MediaFormat.MIMETYPE_VIDEO_HEVC, ignoreCase = true) }
             }
         }.getOrDefault(false)
@@ -190,10 +198,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             addView(home, FrameLayout.LayoutParams(-1, -1))
         }
         setContentView(root)
-        window.setDecorFitsSystemWindows(false)
-        root.setOnApplyWindowInsetsListener { _, insets ->
-            val ime = insets.getInsets(WindowInsets.Type.ime()).bottom
-            val open = insets.isVisible(WindowInsets.Type.ime()) // also true for a floating keyboard
+        fun updateIme(open: Boolean, ime: Int) {
             keyBar.visibility = if (open && streaming) View.VISIBLE else View.GONE
             keyBar.translationY = -ime.toFloat()
             kbdButton.translationY = if (open) -(ime + dp(46)).toFloat() else 0f
@@ -203,7 +208,42 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 imeOpen = open; imeHeight = ime
                 layoutVideo()
             }
-            insets
+        }
+        if (Build.VERSION.SDK_INT >= 30) {
+            window.setDecorFitsSystemWindows(false)
+            root.setOnApplyWindowInsetsListener { _, insets ->
+                val ime = insets.getInsets(WindowInsets.Type.ime()).bottom
+                val open = insets.isVisible(WindowInsets.Type.ime()) // also true for a floating keyboard
+                updateIme(open, ime)
+                insets
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            window.setSoftInputMode(
+                WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE or
+                    WindowManager.LayoutParams.SOFT_INPUT_STATE_HIDDEN
+            )
+            applyImmersive()
+            val visibleRect = Rect()
+            fun refreshImeLegacy() {
+                root.getWindowVisibleDisplayFrame(visibleRect)
+                val rootH = root.rootView.height
+                val ime = maxOf(0, rootH - visibleRect.bottom)
+                val open = ime > dp(100)
+                updateIme(open, if (open) ime else 0)
+            }
+            root.setOnApplyWindowInsetsListener { _, insets ->
+                @Suppress("DEPRECATION")
+                val insetBottom = insets.systemWindowInsetBottom
+                if (insetBottom > dp(100)) {
+                    updateIme(true, insetBottom)
+                } else {
+                    refreshImeLegacy()
+                }
+                @Suppress("DEPRECATION")
+                insets.consumeSystemWindowInsets()
+            }
+            root.viewTreeObserver.addOnGlobalLayoutListener { refreshImeLegacy() }
         }
         root.addOnLayoutChangeListener { _, l, t, r, b, ol, ot, or, ob ->
             if (r - l != or - ol || b - t != ob - ot) layoutVideo()
@@ -220,13 +260,29 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         if (intent.getBooleanExtra(EXTRA_AUTO_LAST, false) && sessionClaim.get() == null) autoLast = true
     }
 
+    private fun applyImmersive() {
+        if (Build.VERSION.SDK_INT >= 30) {
+            window.insetsController?.let {
+                it.hide(WindowInsets.Type.systemBars())
+                it.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            window.decorView.systemUiVisibility = (
+                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
+                    View.SYSTEM_UI_FLAG_FULLSCREEN or
+                    View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+                    View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
+                    View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                    View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                )
+        }
+    }
+
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus) checkClip() // Android only lets the focused app read the clipboard: e.g. back from copying elsewhere
-        if (hasFocus) window.insetsController?.let {
-            it.hide(WindowInsets.Type.systemBars())
-            it.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-        }
+        if (hasFocus) applyImmersive()
     }
 
     override fun onStart() {
@@ -372,12 +428,23 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
     }
 
+    private fun displayBounds(): Pair<Int, Int> {
+        if (Build.VERSION.SDK_INT >= 30) {
+            val b = windowManager.currentWindowMetrics.bounds
+            return b.width() to b.height()
+        }
+        val p = Point()
+        @Suppress("DEPRECATION")
+        windowManager.defaultDisplay.getRealSize(p)
+        return p.x to p.y
+    }
+
     /** Monitor size to ask for: the phone's current orientation, scaled by the resolution setting. */
     private fun viewSize(): Pair<Int, Int> {
-        val b = windowManager.currentWindowMetrics.bounds
+        val (bw, bh) = displayBounds()
         val res = settings.getInt("res", 100)
         fun dim(v: Int) = maxOf(160, v * res / 100 / 8 * 8) // encoders like multiples of 8
-        return dim(b.width()) to dim(b.height())
+        return dim(bw) to dim(bh)
     }
 
     private fun viewMsg(): ByteArray = viewSize().let { (w, h) -> msg(C_VIEW, 0, w, h) }
@@ -653,11 +720,12 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 if (pins != null && fp !in pins) throw CertificateException("unknown laptop certificate")
             }
         }
-        val ctx = SSLContext.getInstance("TLSv1.3").apply { init(null, arrayOf(trust), null) }
+        val proto = if (Build.VERSION.SDK_INT >= 29) "TLSv1.3" else "TLSv1.2"
+        val ctx = SSLContext.getInstance(proto).apply { init(null, arrayOf(trust), null) }
         val plain = Socket()
         plain.connect(InetSocketAddress(host, PORT), timeoutMs)
         val s = ctx.socketFactory.createSocket(plain, host, PORT, true) as SSLSocket
-        s.enabledProtocols = arrayOf("TLSv1.3")
+        s.enabledProtocols = arrayOf(proto)
         s.soTimeout = timeoutMs * 2
         s.startHandshake()
         return s
@@ -783,7 +851,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     private fun toggleKeyboard() {
         val imm = getSystemService(InputMethodManager::class.java)
-        val shown = window.decorView.rootWindowInsets?.isVisible(WindowInsets.Type.ime()) == true
+        val shown = if (Build.VERSION.SDK_INT >= 30) {
+            window.decorView.rootWindowInsets?.isVisible(WindowInsets.Type.ime()) == true
+        } else {
+            imeOpen
+        }
         if (shown) hideKeyboard() else {
             keyCatcher.requestFocus()
             imm.showSoftInput(keyCatcher, 0)
@@ -1396,10 +1468,15 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         if (hello[2] != p.id) error("Unexpected laptop identity")
         val clientNonce = randomHex(16)
         val proof = hmacHex(p.secret, "c|${hello[4]}|$clientNonce")
-        val b = windowManager.maximumWindowMetrics.bounds
+        val (bw, bh) = if (Build.VERSION.SDK_INT >= 30) {
+            val b = windowManager.maximumWindowMetrics.bounds
+            b.width() to b.height()
+        } else {
+            displayBounds()
+        }
         // Laptops before 0.3.0 only read the handshake size: keep it the landscape full size as before.
-        val w = maxOf(b.width(), b.height())
-        val h = minOf(b.width(), b.height())
+        val w = maxOf(bw, bh)
+        val h = minOf(bw, bh)
         s.outputStream.apply {
             val device = p.device?.let { " $it" } ?: ""
             write("HYPRSCREEN 3 $w $h ${resources.displayMetrics.densityDpi} $clientNonce $proof$device\n".toByteArray())
@@ -1696,7 +1773,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         init {
             try {
                 val fmt = MediaFormat.createVideoFormat(mime, w, h).apply {
-                    setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+                    if (Build.VERSION.SDK_INT >= 30) setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
                     setInteger(MediaFormat.KEY_PRIORITY, 0) // realtime
                     setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 8 shl 20)
                 }
